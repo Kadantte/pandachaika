@@ -1,0 +1,137 @@
+import typing
+
+from PIL import Image as PImage
+from PIL import UnidentifiedImageError
+
+from core.base import hashing
+
+if typing.TYPE_CHECKING:
+    from django.db.models import QuerySet
+    from viewer.models import Archive, Image, ItemProperties
+
+
+class CompareObjectsService:
+
+    image_hash_functions = hashing.available_image_hash_functions
+    file_hash_functions = hashing.available_file_hash_functions
+
+    public_algorithms = ["sha1", "phash"]
+
+    # code from imagehash library
+    @staticmethod
+    def alpha_remover(image):
+        if image.mode != "RGBA":
+            return image
+        canvas = PImage.new("RGBA", image.size, (255, 255, 255, 255))
+        canvas.paste(image, mask=image)
+        return canvas.convert("RGB")
+
+    @staticmethod
+    def image_loader(hashfunc, hash_size=8):
+        def inner_function(path: typing.IO | typing.BinaryIO | str):
+            try:
+                image = CompareObjectsService.alpha_remover(PImage.open(path))
+                return str(hashfunc(image))
+            except UnidentifiedImageError:
+                return "null"
+
+        return inner_function
+
+    @classmethod
+    def hash_archives(
+        cls,
+        archives: "QuerySet[Archive]",
+        algorithms: list[str],
+        thumbnails: bool = True,
+        images: bool = True,
+        item_model: "type[ItemProperties] | None" = None,
+        image_model: "type[Image] | None" = None,
+        no_live_data: bool = False,
+    ) -> dict:
+
+        results_per_algorithm: dict[str, dict] = {}
+
+        available_algos = [
+            (x, cls.image_loader(cls.image_hash_functions[x])) for x in algorithms if x in cls.image_hash_functions
+        ]
+        available_algos += [(x, cls.file_hash_functions[x]) for x in algorithms if x in cls.file_hash_functions]
+
+        if no_live_data:
+            available_algos = [x for x in available_algos if x[0] in cls.public_algorithms]
+
+        for algo_name, algo_func in available_algos:
+
+            results: dict[str, dict] = {"archives": {}, "images": {}}
+
+            for archive in archives:
+                if thumbnails:
+                    thumbnail = archive.thumbnail
+                    if thumbnail and not no_live_data:
+                        with open(thumbnail.path, "rb") as thumb:
+                            results["archives"][archive.pk] = algo_func(thumb)
+                if images:
+                    if algo_name == "sha1" and archive.image_set.filter(sha1__isnull=True).count() == 0:
+                        image_result: dict[int, str] = {int(x.position): str(x.sha1) for x in archive.image_set.all()}
+                        results["images"][archive.pk] = image_result
+                    else:
+
+                        if item_model and image_model:
+
+                            from django.contrib.contenttypes.models import ContentType
+
+                            image_type = ContentType.objects.get_for_model(image_model)
+
+                            images_phashes = item_model.objects.filter(
+                                content_type=image_type,
+                                object_id__in=archive.image_set.all(),
+                                tag="hash-compare",
+                                name=algo_name,
+                            )
+
+                            if images_phashes:
+                                archive_img_results = {
+                                    item.content_object.archive_position: item.value
+                                    for item in images_phashes
+                                    if item.content_object
+                                }
+                                results["images"][archive.pk] = archive_img_results
+                            elif not no_live_data:
+                                archive_img_results = archive.hash_images_with_function(algo_func)
+                                results["images"][archive.pk] = archive_img_results
+                        elif not no_live_data:
+                            archive_img_results = archive.hash_images_with_function(algo_func)
+                            results["images"][archive.pk] = archive_img_results
+
+            results_per_algorithm[algo_name] = results
+
+        return results_per_algorithm
+
+    @classmethod
+    def hash_thumbnail(cls, fp: typing.IO | str, algorithm: str) -> str | None:
+
+        if isinstance(fp, str):
+            file_object: typing.IO | typing.BinaryIO = open(fp, "rb")
+        else:
+            file_object = fp
+
+        chosen_algo = None
+
+        if algorithm in cls.file_hash_functions:
+            chosen_algo = cls.file_hash_functions[algorithm]
+
+        if algorithm in cls.image_hash_functions:
+            chosen_algo = cls.image_loader(cls.image_hash_functions[algorithm])
+
+        if not chosen_algo:
+            return None
+
+        result = chosen_algo(file_object)
+        return result
+
+    @classmethod
+    def calculate_phash_for_zip_member(
+            cls, arguments: tuple[str, str, str | None]
+    ) -> tuple[str, str | None]:
+        from core.base.process_pool import worker_calc_phash_for_zip_member
+
+        return worker_calc_phash_for_zip_member(arguments)

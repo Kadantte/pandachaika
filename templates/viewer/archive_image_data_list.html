@@ -19,25 +19,39 @@
   <!-- Next/Prev page links  -->
     {% if results.object_list and results.paginator.num_pages > 1 %}
       <div>
-          <span class="step-links">
-              <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
+        <nav aria-label="Middle navigation">
+          <ul class="pagination justify-content-center my-0">
+            <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+                <span aria-hidden="true">&laquo;</span>
+              </a>
+            </li>
             {% if results.has_previous %}
-              <a href= "?{% url_replace 'page' results.previous_page_number %}"> previous &lt;&lt; </a>
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
+            {% else %}
+              <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
             {% endif %}
-            <span class="current">
-                  &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-              </span>
+            <li class="page-item">
+              <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+            </li>
             {% if results.has_next %}
-              <a href="?{% url_replace 'page' results.next_page_number %}"> &gt;&gt; next</a>
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
+            {% else %}
+              <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
             {% endif %}
-            <a href="?{% url_replace 'page' results.paginator.num_pages %}"> &gt;&gt; last</a>
-          </span>
+            <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+                <span aria-hidden="true">&raquo;</span>
+              </a>
+            </li>
+          </ul>
+        </nav>
       </div>
     {% endif %}
       <table class="table table-bordered table-sm generic-table">
         <thead>
         <tr>
-          <th style="width:4%">#</th><th style="width:7%">Archive Position</th><th>File Name</th><th style="width:7%">File Size</th><th style="width:4%">Height</th><th style="width:4%">Width</th><th style="width:4%">Format</th><th style="width:4%">Mode</th>
+          <th style="width:4%">#</th><th style="width:7%">Archive Position</th><th>File Name</th><th style="width:7%">File Size</th><th style="width:7%">SHA1</th><th style="width:4%">Height</th><th style="width:4%">Width</th><th style="width:4%">Format</th><th style="width:4%">Mode</th>{% if user.is_authenticated and has_contextual_props %}<th>Contextual Info</th>{% endif %}{% if user.is_authenticated %}<th style="width:7%">Download</th>{% endif %}
         </tr>
         </thead>
         <tbody>
@@ -50,10 +64,17 @@
               {{ image.archive_position }}
             </td>
             <td>
-              {{ image.image_name }}
+              {% if user.is_authenticated %}
+                <a href="{% url 'viewer:image-view' image.pk %}">{{ image.image_name }}</a>
+              {% else %}
+                {{ image.image_name }}
+              {% endif %}
             </td>
             <td>
               {{ image.image_size|filesizeformat }}
+            </td>
+            <td>
+              {{ image.sha1 }}
             </td>
             <td>
               {{ image.original_height }}
@@ -67,6 +88,41 @@
             <td>
               {{ image.image_mode }}
             </td>
+            {% if user.is_authenticated and has_contextual_props %}
+              <td class="small">
+                {% if image.contextual_properties %}
+                  {% for prop in image.contextual_properties %}
+                    {% if prop.name == 'bubble_transcripts' %}
+                      {% with bubble_items=prop.value|json_list %}
+                        <div class="mt-1">
+                          <strong>bubble_transcripts ({{ bubble_items|length|default:"0" }}):</strong>
+                          {% if bubble_items %}
+                            <ol class="mb-1 border rounded ps-4 py-1 pe-2" style="max-height: 200px; overflow-y: auto;">
+                              {% for bubble in bubble_items %}
+                                <li class="text-break" style="white-space: pre-line;">{% if bubble %}{{ bubble }}{% else %}<span class="text-muted fst-italic">[empty]</span>{% endif %}</li>
+                              {% endfor %}
+                            </ol>
+                          {% elif bubble_items is not None %}
+                            <span class="text-muted fst-italic">[]</span>
+                          {% else %}
+                            <span class="text-break">{{ prop.value }}</span>
+                          {% endif %}
+                        </div>
+                      {% endwith %}
+                    {% elif prop.name == 'transcript' %}
+                      <div class="mt-1"><strong>transcript:</strong> <span class="text-break" style="white-space: pre-line;">{{ prop.value }}</span></div>
+                    {% else %}
+                      <div><strong>{{ prop.name }}:</strong> <span class="text-break">{{ prop.value }}</span></div>
+                    {% endif %}
+                  {% endfor %}
+                {% endif %}
+              </td>
+            {% endif %}
+            {% if user.is_authenticated %}
+              <td class="text-center">
+                <a class="btn btn-outline-primary btn-sm" href="{% url 'viewer:image-download' image.pk %}">Download</a>
+              </td>
+            {% endif %}
           </tr>
         {% endfor %}
         </tbody>
@@ -74,17 +130,33 @@
   <!-- Next/Prev page links  -->
     {% if results.object_list and results.paginator.num_pages > 1 %}
       <div>
-          <span class="step-links">
-              {% if results.has_previous %}
-                <a href= "?page={{ results.previous_page_number }}">previous &lt;&lt; </a>
-              {% endif %}
-            <span class="current">
-                  &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-              </span>
-            {% if results.has_next %}
-              <a href="?page={{ results.next_page_number }}"> &gt;&gt; next</a>
+        <nav aria-label="Middle navigation">
+          <ul class="pagination justify-content-center">
+            <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+                <span aria-hidden="true">&laquo;</span>
+              </a>
+            </li>
+            {% if results.has_previous %}
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
+            {% else %}
+              <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
             {% endif %}
-          </span>
+            <li class="page-item">
+              <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+            </li>
+            {% if results.has_next %}
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
+            {% else %}
+              <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
+            {% endif %}
+            <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+                <span aria-hidden="true">&raquo;</span>
+              </a>
+            </li>
+          </ul>
+        </nav>
       </div>
     {% endif %}
 {% endblock %}

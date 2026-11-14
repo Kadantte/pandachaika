@@ -2,14 +2,15 @@ import html
 import json
 import re
 from json import JSONDecodeError
-from typing import Any, TypeVar, Union, ItemsView, Optional
+from typing import Any
 
 from django import template
 from django.template import RequestContext
 from django.template.defaultfilters import stringfilter
+from django.template.defaulttags import GroupedResult
 from django.utils.encoding import punycode
 from django.utils.functional import keep_lazy_text
-from django.utils.html import smart_urlquote, Urlizer, escape  # type: ignore[attr-defined]
+from django.utils.html import smart_urlquote, Urlizer, escape
 from django.utils.safestring import SafeText, mark_safe
 
 from core.base.utilities import translate_tag, artist_from_title
@@ -18,89 +19,197 @@ from viewer.utils.tags import sort_tags
 
 register = template.Library()
 
-T = TypeVar('T', float, int)
-
 
 @register.simple_tag(takes_context=True)
 def url_toggle(context: RequestContext, field: SafeText) -> str:
-    dict_ = context['request'].GET.copy()
+    dict_ = context["request"].GET.copy()
 
     if field in dict_:
         del dict_[field]
     else:
-        dict_[field] = ''
+        dict_[field] = ""
 
     return dict_.urlencode()
 
 
 @register.simple_tag(takes_context=True)
 def url_replace(context: RequestContext, field: SafeText, value: SafeText) -> str:
-    dict_ = context['request'].GET.copy()
+    dict_ = context["request"].GET.copy()
     dict_[field] = str(value)
     return dict_.urlencode()
 
 
 @register.simple_tag(takes_context=True)
 def url_multi_replace(context: RequestContext, **kwargs: Any) -> str:
-    dict_ = context['request'].GET.copy()
+    dict_ = context["request"].GET.copy()
     for key, value in kwargs.items():
         dict_[key] = str(value)
     return dict_.urlencode()
 
 
 @register.filter
-def subtract(value: T, arg: T) -> T:
+def subtract[T: (float, int)](value: T, arg: T) -> T:
     return value - arg
 
 
 @register.filter
 def revert_order(order: str) -> str:
-    if order == 'desc':
-        order = 'asc'
-    elif order == 'asc':
-        order = 'desc'
+    if order == "desc":
+        order = "asc"
+    elif order == "asc":
+        order = "desc"
     else:
-        order = 'desc'
+        order = "desc"
     return order
 
 
 @register.filter
 def color_percent(fraction: int, total: int) -> str:
     if total == 0:
-        return ''
+        return ""
     try:
         fraction_i = float(fraction)
         if float(fraction_i) > float(total):
             fraction_i = float(fraction_i) - 2 * (float(fraction_i) - float(total))
-        result = ((float(fraction_i) / float(total)) * 100)
+        result = (float(fraction_i) / float(total)) * 100
         if result >= 100:
-            return 'total'
+            return "total"
         elif result > 90:
-            return 'very-high'
+            return "very-high"
         elif result > 80:
-            return 'high'
+            return "high"
         else:
-            return ''
+            return ""
     except ValueError:
-        return ''
+        return ""
 
 
 @register.filter
 def mark_color(mark_priority: float) -> str:
     if mark_priority >= 4:
-        return 'mark-high'
-    elif 4 > mark_priority >= 1:
-        return 'mark-mid'
+        return "mark-high"
+    elif 4 > mark_priority >= 3:
+        return "mark-mid-high"
+    elif 3 > mark_priority >= 2:
+        return "mark-mid-mid"
+    elif 2 > mark_priority >= 1:
+        return "mark-mid-low"
     else:
-        return 'mark-low'
+        return "mark-low"
+
+
+@register.filter(is_safe=True)
+def boolean_badge(value: Any, arg: str | None = None) -> SafeText:
+    """
+    Renders a boolean or truthy value as a styled Bootstrap badge.
+    arg format: 'TrueLabel,FalseLabel[,color_type]' or just 'color_type'
+    color_type can be: success (default), danger, warning, info, primary, secondary.
+    """
+    true_label = "Yes"
+    false_label = "No"
+    color_type = "success"
+
+    if arg:
+        parts = [p.strip() for p in arg.split(",")]
+        if len(parts) == 1:
+            if parts[0] in ("danger", "warning", "info", "primary", "secondary", "success", "dark", "light"):
+                color_type = parts[0]
+            else:
+                true_label = parts[0]
+        elif len(parts) >= 2:
+            true_label, false_label = parts[0], parts[1]
+            if len(parts) >= 3:
+                color_type = parts[2]
+
+    if value:
+        if color_type == "warning":
+            badge_class = "badge bg-warning text-dark"
+        elif color_type == "info":
+            badge_class = "badge bg-info text-dark"
+        elif color_type in ("danger", "primary", "secondary", "light", "dark"):
+            badge_class = f"badge bg-{color_type}"
+        else:
+            badge_class = "badge bg-success"
+        label = true_label
+    else:
+        badge_class = "badge bg-secondary"
+        label = false_label
+
+    return mark_safe(f'<span class="{badge_class}">{escape(label)}</span>')
+
+
+@register.filter(is_safe=True)
+def boolean_text(value: Any, arg: str | None = None) -> SafeText:
+    """
+    Renders a boolean or truthy value as styled colored text.
+    arg format: 'TrueLabel,FalseLabel[,color_type]' or just 'color_type'
+    """
+    true_label = "Yes"
+    false_label = "No"
+    color_type = "success"
+
+    if arg:
+        parts = [p.strip() for p in arg.split(",")]
+        if len(parts) == 1:
+            if parts[0] in ("danger", "warning", "info", "primary", "secondary", "success", "dark", "light"):
+                color_type = parts[0]
+            else:
+                true_label = parts[0]
+        elif len(parts) >= 2:
+            true_label, false_label = parts[0], parts[1]
+            if len(parts) >= 3:
+                color_type = parts[2]
+
+    if value:
+        if color_type == "warning":
+            text_class = "text-warning fw-semibold"
+        else:
+            text_class = f"text-{color_type} fw-semibold"
+        label = true_label
+    else:
+        text_class = "text-secondary"
+        label = false_label
+
+    return mark_safe(f'<span class="{text_class}">{escape(label)}</span>')
+
+
+_SENSITIVE_SETTING_SUBSTRINGS = (
+    "password",
+    "passwd",
+    "secret",
+    "pass_hash",
+    "api_key",
+    "passkey",
+    "token",
+    "cookie",
+)
+
+
+def _is_sensitive_setting_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    lowered = key.lower()
+    if lowered == "config":
+        return True
+    return any(part in lowered for part in _SENSITIVE_SETTING_SUBSTRINGS)
+
+
+def _redact_setting_value(key: Any, val: Any) -> Any:
+    if _is_sensitive_setting_key(key):
+        return "***REDACTED***" if val else val
+    if isinstance(val, dict):
+        return {k: _redact_setting_value(k, v) for k, v in val.items()}
+    return val
 
 
 @register.filter
-def format_setting_value(value: T) -> Union[T, ItemsView[str, Any]]:
-    if hasattr(value, '__dict__'):
-        return vars(value).items()
-    elif hasattr(value, '__slots__'):
-        return {k: getattr(value, k) for k in value.__slots__}.items()
+def format_setting_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return [(k, _redact_setting_value(k, v)) for k, v in value.items()]
+    elif hasattr(value, "__dict__"):
+        return [(k, _redact_setting_value(k, v)) for k, v in vars(value).items()]
+    elif hasattr(value, "__slots__"):
+        return [(k, _redact_setting_value(k, getattr(value, k))) for k in value.__slots__]
     else:
         return value
 
@@ -111,12 +220,16 @@ SPECIAL_FINAL = r"<a href=\2>\1</a>"
 SPECIAL_RE_OLD = re.compile(r"special-link:(/archive/\d+/?)")
 SPECIAL_FINAL_OLD = r"<a href=\1>\1</a>"
 
+POPOVER_IMG_RE = re.compile(r"\(popover-img\):\((.*?)\)?\((.*?)\)")
+POPOVER_IMG_FINAL = r'<a href="#" class="img-preview" data-image-url=\2 rel="popover">\1</a>'
+
 
 @register.filter(is_safe=True)
 @stringfilter
 def convert_special_urls(value: str) -> str:
     value = re.sub(SPECIAL_RE, SPECIAL_FINAL, value)
     value = re.sub(SPECIAL_RE_OLD, SPECIAL_FINAL_OLD, value)
+    value = re.sub(POPOVER_IMG_RE, POPOVER_IMG_FINAL, value)
     return value
 
 
@@ -146,7 +259,7 @@ class UrlizerNoRef(Urlizer):
             lead, middle, trail = self.trim_punctuation(word)
             # Make URL we want to point to.
             url = None
-            nofollow_attr = ' rel="noopener noreferrer nofollow"' if nofollow else ''
+            nofollow_attr = ' rel="noopener noreferrer nofollow"' if nofollow else ""
             if self.simple_url_re.match(middle):
                 url = smart_urlquote(html.unescape(middle))
             elif self.simple_url_2_re.match(middle):
@@ -190,19 +303,17 @@ urlizer_all_rel = UrlizerNoRef()
 @stringfilter
 @keep_lazy_text
 def urlize_all_rel(text, trim_url_limit=None, nofollow=True, autoescape=True):
-    return mark_safe(urlizer_all_rel(
-        text, trim_url_limit=trim_url_limit, nofollow=nofollow, autoescape=autoescape
-    ))
+    return mark_safe(urlizer_all_rel(text, trim_url_limit=trim_url_limit, nofollow=nofollow, autoescape=autoescape))
 
 
 @register.filter
 def archive_title_class(archive: Archive) -> str:
     if not archive.crc32:
-        title_class = 'archive-incomplete'
+        title_class = "archive-incomplete"
     elif archive.gallery and archive.gallery.filesize and archive.filesize != archive.gallery.filesize:
-        title_class = 'archive-diff'
+        title_class = "archive-diff"
     else:
-        title_class = ''
+        title_class = ""
     return title_class
 
 
@@ -212,50 +323,90 @@ def get_list(dictionary, key):
 
 
 @register.filter
-def artist_name_from_str(title: Optional[str]) -> str:
+def artist_name_from_str(title: str | None) -> str:
     if title:
         return translate_tag(artist_from_title(title))
     else:
-        return ''
+        return ""
 
 
 ARCHIVE_INCLUDED_FIELDS = (
-    'title', 'title_jpn', 'source_type', 'reason', 'public_date', 'public', 'gallery', 'filecount', 'filesize',
-    'extracted', 'details', 'crc32', 'binned'
+    "title",
+    "title_jpn",
+    "source_type",
+    "reason",
+    "public_date",
+    "public",
+    "gallery",
+    "filecount",
+    "filesize",
+    "extracted",
+    "details",
+    "crc32",
+    "binned",
 )
 
 
 @register.filter
 def changes_archive_delta(new_record):
-    prev_record = new_record.prev_record
+    if hasattr(new_record, "cached_prev_record"):
+        prev_record = new_record.cached_prev_record
+    else:
+        prev_record = new_record.prev_record
     if prev_record is None:
         return []
-    delta = new_record.diff_against(
-        prev_record,
-        included_fields=ARCHIVE_INCLUDED_FIELDS
-    )
+    delta = new_record.diff_against(prev_record, included_fields=ARCHIVE_INCLUDED_FIELDS)
     return delta.changes
 
 
 GALLERY_INCLUDED_FIELDS = (
-    'title', 'title_jpn', 'category', 'uploader', 'comment', 'posted', 'filecount', 'filesize',
-    'expunged', 'rating', 'fjord', 'public', 'dl_type', 'reason', 'thumbnail_url', 'status'
+    "title",
+    "title_jpn",
+    "category",
+    "uploader",
+    "comment",
+    "posted",
+    "filecount",
+    "filesize",
+    "expunged",
+    "disowned",
+    "rating",
+    "fjord",
+    "public",
+    "dl_type",
+    "reason",
+    "thumbnail_url",
+    "status",
+    "tags"
 )
 
 GALLERY_PUBLIC_INCLUDED_FIELDS = (
-    'title', 'title_jpn', 'category', 'uploader', 'comment', 'posted', 'filecount', 'filesize',
-    'expunged', 'rating'
+    "title",
+    "title_jpn",
+    "category",
+    "uploader",
+    "comment",
+    "posted",
+    "filecount",
+    "filesize",
+    "expunged",
+    "disowned",
+    "rating",
+    "tags"
 )
 
 
 @register.filter
 def changes_gallery_delta(new_record, is_authenticated=False):
-    prev_record = new_record.prev_record
+    if hasattr(new_record, "cached_prev_record"):
+        prev_record = new_record.cached_prev_record
+    else:
+        prev_record = new_record.prev_record
     if prev_record is None:
         return []
     delta = new_record.diff_against(
-        prev_record,
-        included_fields=GALLERY_INCLUDED_FIELDS if is_authenticated else GALLERY_PUBLIC_INCLUDED_FIELDS
+        prev_record, included_fields=GALLERY_INCLUDED_FIELDS if is_authenticated else GALLERY_PUBLIC_INCLUDED_FIELDS,
+        foreign_keys_are_objs=True
     )
     return delta.changes
 
@@ -267,7 +418,7 @@ def tag_query_to_tag_lists(tag_query) -> list[tuple[str, list[Tag]]]:
 
 @register.filter
 def tag_history_to_tag_lists(history) -> list[tuple[str, list[Tag]]]:
-    tag_query = history.historicalgallery_tags_set.all().prefetch_related('tag')
+    tag_query = history.historicalgallery_tags_set.all().prefetch_related("tag")
     return sort_tags([x.tag for x in tag_query])
 
 
@@ -278,15 +429,15 @@ def gallery_history_fields(new_record, is_authenticated=False):
 
     history_fields = {gallery_field: getattr(new_record, gallery_field) for gallery_field in fields_to_check}
 
-    history_fields['tags'] = ''
+    history_fields["tags"] = ""
 
     return history_fields.items()
 
 
 @register.filter
-def format_json(maybe_json: Optional[str]) -> str:
+def format_json(maybe_json: str | None) -> str:
     if maybe_json is None:
-        return 'None'
+        return "None"
     try:
         json_data = json.loads(maybe_json)
 
@@ -302,4 +453,30 @@ def format_json(maybe_json: Optional[str]) -> str:
     except JSONDecodeError:
         return maybe_json
 
+
+@register.filter
+def escape_colon(word: str):
+    return word.replace(":", "%3A")
+
+
+@register.filter
+def json_list(value: Any) -> list[Any] | None:
+    """Parse JSON string into a list, or return value if already a list."""
+    if isinstance(value, list):
+        return value
+    if not value or not isinstance(value, str):
+        return None
+    val_str = value.strip()
+    if not val_str.startswith("["):
+        return None
+    try:
+        data = json.loads(val_str)
+        return data if isinstance(data, list) else None
+    except (ValueError, TypeError, JSONDecodeError):
+        return None
+
+
+@register.filter
+def sort_regrouped_by_max_value_in_list(elements: list[GroupedResult], field: str) -> list[GroupedResult]:
+    return sorted(elements, key=lambda x:getattr(max(x.list, key=lambda item: getattr(item, field)), field), reverse=True)
 

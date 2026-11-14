@@ -4,28 +4,35 @@ unittest). These will both pass when you run "manage.py test".
 
 Replace these with more appropriate tests for your application.
 """
-from django.test import TestCase, Client
-from django.contrib.auth.models import User
-from django.urls import reverse
 
-from viewer.models import Tag, Archive, Gallery, WantedGallery, ArchiveTag
+from django.test import TestCase, Client, override_settings
+from django.contrib.auth.models import User, Permission
+from django.urls import reverse
+from django.core.files.uploadedfile import SimpleUploadedFile
+
+import json
+import os
+import shutil
+import tempfile
+
+from viewer.models import Tag, Archive, Gallery, WantedGallery, ArchiveTag, FoundGallery, ArchiveManageEntry
 
 
 class TagTestCase(TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
+        cls.test_user1 = User.objects.create_user(username="testuser1", password="12345")
 
-        test_user1 = User.objects.create_user(username='testuser1', password='12345')
-        test_user1.save()
-
-        self.gallery_tag1 = Tag.objects.create(name="sister", scope="female")
-        self.gallery_tag2 = Tag.objects.create(name="hisasi", scope="artist")
-        self.archive_tag1 = Tag.objects.create(name="distance", scope="artist")
-        self.custom_tag = Tag.objects.create(scope="custom", name="adjective", source="user")
-        self.test_gallery1 = Gallery.objects.create(title='sample non public gallery 1', gid='344', provider='panda')
-        self.test_gallery1.tags.set([self.gallery_tag1, self.gallery_tag2])
-        self.archive1 = Archive.objects.create(title='sample Archive', user=test_user1)
-        archive_tag = ArchiveTag(archive=self.archive1, tag=self.archive_tag1, origin=ArchiveTag.ORIGIN_SYSTEM)
-        archive_tag.save()
+        cls.gallery_tag1 = Tag.objects.create(name="sister", scope="female")
+        cls.gallery_tag2 = Tag.objects.create(name="hisasi", scope="artist")
+        cls.archive_tag1 = Tag.objects.create(name="distance", scope="artist")
+        cls.custom_tag = Tag.objects.create(scope="custom", name="adjective", source="user")
+        cls.test_gallery1 = Gallery.objects.create(title="sample non public gallery 1", gid="344", provider="panda")
+        cls.test_gallery1.tags.set([cls.gallery_tag1, cls.gallery_tag2])
+        cls.archive1 = Archive.objects.create(title="sample Archive", user=cls.test_user1)
+        ArchiveTag.objects.create(
+            archive=cls.archive1, tag=cls.archive_tag1, origin=ArchiveTag.ORIGIN_SYSTEM
+        )
 
     def test_first_artist_tag(self):
         """Test obtain first artist tag"""
@@ -34,8 +41,8 @@ class TagTestCase(TestCase):
 
     def test_tag_formatting(self):
         """Test default tag formatting"""
-        tag = Tag.objects.get(scope='female', name='sister')
-        self.assertIn(':', str(tag))
+        tag = Tag.objects.get(scope="female", name="sister")
+        self.assertIn(":", str(tag))
 
     def test_preserve_custom_tag_on_gallery_update(self):
         archive_custom_tag = ArchiveTag(archive=self.archive1, tag=self.custom_tag, origin=ArchiveTag.ORIGIN_USER)
@@ -53,184 +60,220 @@ class TagTestCase(TestCase):
 
 
 class PrivateURLsTest(TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
+        cls.test_admin1 = User.objects.create_user(username="admin1", password="12345")
+        cls.test_admin1.is_staff = True
+        cls.test_admin1.save()
 
-        # Admin user
-        test_admin1 = User.objects.create_user(username='admin1', password='12345')
-        test_admin1.is_staff = True
-        test_admin1.save()
+        cls.test_user1 = User.objects.create_user(username="testuser1", password="12345")
 
-        # Registered user
-        test_user1 = User.objects.create_user(username='testuser1', password='12345')
-        test_user1.save()
+        cls.tag1 = Tag.objects.create(name="sister", scope="female")
+        cls.tag2 = Tag.objects.create(name="hisasi", scope="artist")
+        cls.tag3 = Tag.objects.create(name="fue", scope="artist")
+        cls.tag4 = Tag.objects.create(name="anzuame", scope="artist")
+        cls.tag_english = Tag.objects.create(name="english", scope="language")
 
-        # Tags
-        self.tag1 = Tag.objects.create(name="sister", scope="female")
-        self.tag2 = Tag.objects.create(name="hisasi", scope="artist")
-        self.tag3 = Tag.objects.create(name="fue", scope="artist")
-        self.tag4 = Tag.objects.create(name="anzuame", scope="artist")
-        self.tag_english = Tag.objects.create(name="english", scope="language")
+        cls.tag_custom1 = Tag.objects.create(name="special_edition", scope="")
+        cls.tag_custom2 = Tag.objects.create(name="limited_edition", scope="")
 
-        self.tag_custom1 = Tag.objects.create(name="special_edition", scope="")
-        self.tag_custom2 = Tag.objects.create(name="limited_edition", scope="")
+        cls.test_gallery1 = Gallery.objects.create(
+            title="sample non public gallery 1", gid="344", provider="panda", category="Manga"
+        )
+        cls.test_gallery1.tags.add(cls.tag1, cls.tag2, cls.tag_english)
+        cls.test_gallery2 = Gallery.objects.create(
+            title="sample non public gallery 2", gid="342", provider="test", category="Doujinshi"
+        )
+        cls.test_gallery2.tags.add(cls.tag1, cls.tag3, cls.tag_english)
+        cls.test_gallery3 = Gallery.objects.create(
+            title="sample non public gallery 3", gid="897", provider="test", category="Manga", public=True
+        )
+        cls.test_gallery3.tags.add(cls.tag1, cls.tag4)
 
-        # Galleries
-        self.test_gallery1 = Gallery.objects.create(title='sample non public gallery 1', gid='344', provider='panda', category='Manga')
-        self.test_gallery1.tags.add(self.tag1, self.tag2, self.tag_english)
-        self.test_gallery2 = Gallery.objects.create(title='sample non public gallery 2', gid='342', provider='test', category='Doujinshi')
-        self.test_gallery2.tags.add(self.tag1, self.tag3, self.tag_english)
-        self.test_gallery3 = Gallery.objects.create(title='sample non public gallery 3', gid='897', provider='test', category='Manga', public=True)
-        self.test_gallery3.tags.add(self.tag1, self.tag4)
+        cls.test_book1 = Archive.objects.create(title="sample non public archive", user=cls.test_admin1)
+        cls.test_book2 = Archive.objects.create(
+            title="sample public archive", user=cls.test_admin1, public=True, gallery=cls.test_gallery2
+        )
+        cls.test_book3 = Archive.objects.create(
+            title="new public archive sample", user=cls.test_admin1, public=True, gallery=cls.test_gallery3
+        )
+        cls.test_book4 = Archive.objects.create(
+            title="new private archive sample", user=cls.test_admin1, public=False, gallery=cls.test_gallery1
+        )
 
-        # Archives
-        self.test_book1 = Archive.objects.create(title='sample non public archive', user=test_admin1)
-        self.test_book2 = Archive.objects.create(title='sample public archive', user=test_admin1, public=True, gallery=self.test_gallery2)
-        self.test_book3 = Archive.objects.create(title='new public archive sample', user=test_admin1, public=True, gallery=self.test_gallery3)
-        self.test_book4 = Archive.objects.create(title='new private archive sample', user=test_admin1, public=False, gallery=self.test_gallery1)
+        ArchiveTag.objects.bulk_create(
+            [
+                ArchiveTag(archive=cls.test_book4, tag=cls.tag_custom1, origin=ArchiveTag.ORIGIN_USER),
+                ArchiveTag(archive=cls.test_book4, tag=cls.tag_custom2, origin=ArchiveTag.ORIGIN_USER),
+            ]
+        )
 
-        archive_tag1 = ArchiveTag(archive=self.test_book4, tag=self.tag_custom1, origin=ArchiveTag.ORIGIN_USER)
-        archive_tag2 = ArchiveTag(archive=self.test_book4, tag=self.tag_custom2, origin=ArchiveTag.ORIGIN_USER)
-        archive_tag1.save()
-        archive_tag2.save()
-
-        self.test_books = []
-
+        bulk_archives = []
         for i in range(3):
-            self.test_books.append(Archive.objects.create(title='new private archive sample {}'.format(i+1), user=test_admin1, public=False, gallery=self.test_gallery3))
-
+            bulk_archives.append(
+                Archive(
+                    title="new private archive sample {}".format(i + 1),
+                    user=cls.test_admin1,
+                    public=False,
+                    gallery=cls.test_gallery3,
+                )
+            )
         for i in range(3):
-            self.test_books.append(Archive.objects.create(title='new private archive sample {}'.format(i+1), user=test_admin1, public=False, gallery=self.test_gallery1))
-
+            bulk_archives.append(
+                Archive(
+                    title="new private archive sample {}".format(i + 1),
+                    user=cls.test_admin1,
+                    public=False,
+                    gallery=cls.test_gallery1,
+                )
+            )
         for i in range(50):
-            self.test_books.append(Archive.objects.create(title='new public archive sample {}'.format(i+1), user=test_admin1, public=True))
-
+            bulk_archives.append(
+                Archive(
+                    title="new public archive sample {}".format(i + 1),
+                    user=cls.test_admin1,
+                    public=True,
+                )
+            )
         for i in range(10):
-            self.test_books.append(Archive.objects.create(title='new private file sample {}'.format(i+1), user=test_admin1, public=False))
+            bulk_archives.append(
+                Archive(
+                    title="new private file sample {}".format(i + 1),
+                    user=cls.test_admin1,
+                    public=False,
+                )
+            )
+        cls.test_books = Archive.objects.bulk_create(bulk_archives)
 
     def test_redirect_if_not_logged_in(self):
         """Test to deny access to log page"""
-        resp = self.client.get(reverse('viewer:logs'))
+        resp = self.client.get(reverse("viewer:logs"))
         self.assertEqual(resp.status_code, 302)
-        self.assertTrue(resp.url.startswith('/login/?next=/logs/'))
+        self.assertTrue(resp.url.startswith("/login/?next=/logs/"))
 
     def test_HTTP404_for_invalid_archive(self):
-        self.client.login(username='testuser1', password='12345')
-        resp = self.client.get(reverse('viewer:archive', args=[9999]))
+        self.client.login(username="testuser1", password="12345")
+        resp = self.client.get(reverse("viewer:archive", args=[9999]))
         self.assertEqual(resp.status_code, 404)
         self.client.logout()
-        resp = self.client.get(reverse('viewer:archive', args=[9999]))
+        resp = self.client.get(reverse("viewer:archive", args=[9999]))
         self.assertEqual(resp.status_code, 404)
 
     def test_HTTP404_for_non_public_archive_if_not_logged_in(self):
-        resp = self.client.get(reverse('viewer:archive', args=[self.test_book1.pk]))
+        resp = self.client.get(reverse("viewer:archive", args=[self.test_book1.pk]))
         self.assertEqual(resp.status_code, 404)
 
     def test_for_public_archive_if_not_logged_in(self):
-        resp = self.client.get(reverse('viewer:archive', args=[self.test_book2.pk]))
+        resp = self.client.get(reverse("viewer:archive", args=[self.test_book2.pk]))
         self.assertEqual(resp.status_code, 200)
 
     def test_public_archive_search(self):
-        response = self.client.get(reverse('viewer:archive-search'), {'title': 'archive'})
+        response = self.client.get(reverse("viewer:archive-search"), {"title": "archive"})
         self.assertEqual(response.status_code, 200)
         # Check that pagination works (only 1 page)
-        self.assertFalse(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
+        self.assertFalse(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
         # Check that the rendered context contains 52 archives.
-        self.assertEqual(len(response.context['results']), 52)
+        self.assertEqual(len(response.context["results"]), 52)
 
     def test_logged_in_archive_search(self):
         # Login, and get the 3 archives.
         c = Client()
-        c.login(username='testuser1', password='12345')
+        c.login(username="testuser1", password="12345")
         # List view
-        response = c.get(reverse('viewer:archive-search'), {'title': 'archive', 'view': 'list'})
+        response = c.get(reverse("viewer:archive-search"), {"title": "archive", "view": "list"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.context['results']), 60)
-        self.assertFalse(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
+        self.assertEqual(len(response.context["results"]), 60)
+        self.assertFalse(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
         # Cover view
-        response = c.get(reverse('viewer:archive-search'), {'title': 'archive', 'view': 'cover'})
+        response = c.get(reverse("viewer:archive-search"), {"title": "archive", "view": "cover"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.context['results']), 24)
-        self.assertTrue(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
-        self.assertEqual(response.context['results'].paginator.count, 60)
+        self.assertEqual(len(response.context["results"]), 24)
+        self.assertTrue(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
+        self.assertEqual(response.context["results"].paginator.count, 60)
         # Extended view
-        response = c.get(reverse('viewer:archive-search'), {'title': 'archive', 'view': 'extended'})
+        response = c.get(reverse("viewer:archive-search"), {"title": "archive", "view": "extended"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.context['results']), 24)
-        self.assertTrue(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
-        self.assertEqual(response.context['results'].paginator.count, 60)
+        self.assertEqual(len(response.context["results"]), 24)
+        self.assertTrue(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
+        self.assertEqual(response.context["results"].paginator.count, 60)
 
     def test_quick_search(self):
         # c.login(username='fred', password='secret')
-        response = self.client.get(reverse('viewer:archive-search'), {'qsearch': 'archive'})
+        response = self.client.get(reverse("viewer:archive-search"), {"qsearch": "archive"})
         self.assertEqual(response.status_code, 200)
         # Check that pagination works (only 1 page)
-        self.assertFalse(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
+        self.assertFalse(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
         # Check that the rendered context contains 2 archives.
-        self.assertEqual(len(response.context['results']), 52)
+        self.assertEqual(len(response.context["results"]), 52)
 
 
 class GeneralPagesTest(TestCase):
-    def setUp(self):
+    @classmethod
+    def setUpTestData(cls):
+        cls.test_admin1 = User.objects.create_user(username="admin1", password="12345")
+        cls.test_admin1.is_staff = True
+        cls.test_admin1.save()
 
-        # Admin user
-        test_admin1 = User.objects.create_user(username='admin1', password='12345')
-        test_admin1.is_staff = True
-        test_admin1.save()
+        cls.test_user1 = User.objects.create_user(username="testuser1", password="12345")
 
-        # Registered user
-        test_user1 = User.objects.create_user(username='testuser1', password='12345')
-        test_user1.save()
+        cls.tag1 = Tag.objects.create(name="sister", scope="female")
+        cls.tag2 = Tag.objects.create(name="hisasi", scope="artist")
+        cls.tag3 = Tag.objects.create(name="fue", scope="artist")
+        cls.tag4 = Tag.objects.create(name="anzuame", scope="artist")
+        cls.tag_english = Tag.objects.create(name="english", scope="language")
 
-        # Tags
-        self.tag1 = Tag.objects.create(name="sister", scope="female")
-        self.tag2 = Tag.objects.create(name="hisasi", scope="artist")
-        self.tag3 = Tag.objects.create(name="fue", scope="artist")
-        self.tag4 = Tag.objects.create(name="anzuame", scope="artist")
-        self.tag_english = Tag.objects.create(name="english", scope="language")
+        cls.test_gallery1 = Gallery.objects.create(
+            title="sample non public gallery 1", gid="344", provider="panda", category="Manga"
+        )
+        cls.test_gallery1.tags.add(cls.tag1, cls.tag2, cls.tag_english)
+        cls.test_gallery2 = Gallery.objects.create(
+            title="sample non public gallery 2", gid="342", provider="test", category="Doujinshi"
+        )
+        cls.test_gallery2.tags.add(cls.tag1, cls.tag3, cls.tag_english)
+        cls.test_gallery3 = Gallery.objects.create(
+            title="sample non public gallery 3", gid="897", provider="test", category="Manga", public=True
+        )
+        cls.test_gallery3.tags.add(cls.tag1, cls.tag4)
 
-        # Galleries
-        self.test_gallery1 = Gallery.objects.create(title='sample non public gallery 1', gid='344', provider='panda', category='Manga')
-        self.test_gallery1.tags.add(self.tag1, self.tag2, self.tag_english)
-        self.test_gallery2 = Gallery.objects.create(title='sample non public gallery 2', gid='342', provider='test', category='Doujinshi')
-        self.test_gallery2.tags.add(self.tag1, self.tag3, self.tag_english)
-        self.test_gallery3 = Gallery.objects.create(title='sample non public gallery 3', gid='897', provider='test', category='Manga', public=True)
-        self.test_gallery3.tags.add(self.tag1, self.tag4)
+        cls.test_book1 = Archive.objects.create(title="archive 1", user=cls.test_admin1, gallery=cls.test_gallery1)
+        cls.test_book1b = Archive.objects.create(title="archive 1b", user=cls.test_admin1, gallery=cls.test_gallery1)
+        cls.test_book2 = Archive.objects.create(
+            title="archive 2", user=cls.test_admin1, gallery=cls.test_gallery2, public=True
+        )
+        cls.test_book3 = Archive.objects.create(title="archive 3", user=cls.test_admin1, public=True)
+        cls.test_book4 = Archive.objects.create(
+            title="book 4", user=cls.test_admin1, gallery=cls.test_gallery2, public=True
+        )
+        cls.test_book5 = Archive.objects.create(
+            title="archive 5", user=cls.test_admin1, gallery=cls.test_gallery2, public=True
+        )
 
-        # Archives
-        self.test_book1 = Archive.objects.create(title='archive 1', user=test_admin1, gallery=self.test_gallery1)
-        self.test_book1b = Archive.objects.create(title='archive 1b', user=test_admin1, gallery=self.test_gallery1)
-        self.test_book2 = Archive.objects.create(title='archive 2', user=test_admin1, gallery=self.test_gallery2, public=True)
-        self.test_book3 = Archive.objects.create(title='archive 3', user=test_admin1, public=True)
-        self.test_book4 = Archive.objects.create(title='book 4', user=test_admin1, gallery=self.test_gallery2, public=True)
-        self.test_book5 = Archive.objects.create(title='archive 5', user=test_admin1, gallery=self.test_gallery2, public=True)
-
-        # WantedGalleries
-        self.test_wanted_gallery1 = WantedGallery.objects.create(
-            title='test wanted gallery',
-            title_jpn='テスト募集ギャラリー',
-            search_title='sample non',
-            book_type='Manga',
+        cls.test_wanted_gallery1 = WantedGallery.objects.create(
+            title="test wanted gallery",
+            title_jpn="テスト募集ギャラリー",
+            search_title="sample non",
+            book_type="Manga",
             page_count=23,
-            publisher='wanimagazine',
-            reason='wanimagazine',
+            publisher="wanimagazine",
+            reason="wanimagazine",
             public=False,
             should_search=True,
             keep_searching=False,
             notify_when_found=False,
         )
-        self.test_wanted_gallery2 = WantedGallery.objects.create(
-            title='test wanted gallery 2',
-            title_jpn='テスト募集ギャラリー',
-            search_title='public gallery',
-            book_type='Doujinshi',
+        cls.test_wanted_gallery2 = WantedGallery.objects.create(
+            title="test wanted gallery 2",
+            title_jpn="テスト募集ギャラリー",
+            search_title="public gallery",
+            book_type="Doujinshi",
             page_count=50,
-            publisher='wanimagazine',
-            reason='wanimagazine',
+            publisher="wanimagazine",
+            reason="wanimagazine",
             public=True,
             should_search=True,
             keep_searching=False,
@@ -239,75 +282,1465 @@ class GeneralPagesTest(TestCase):
 
     def test_repeated_archives(self):
         c = Client()
-        c.login(username='admin1', password='12345')
-        response = c.get(reverse('viewer:repeated-archives'), {'title': 'gallery'})
+        c.login(username="admin1", password="12345")
+        response = c.get(reverse("viewer:repeated-archives"), {"title": "gallery"})
         self.assertEqual(response.status_code, 200)
         # Check that pagination works (only 1 page)
-        self.assertFalse(response.context['results'].has_next())
-        self.assertFalse(response.context['results'].has_previous())
+        self.assertFalse(response.context["results"].has_next())
+        self.assertFalse(response.context["results"].has_previous())
         # Check that the rendered context contains 2 archives.
-        self.assertEqual(len(response.context['results']), 2)
-        self.assertEqual(response.context['results'][0].archive_set.count(), 3)
-        self.assertEqual(response.context['results'][1].archive_set.count(), 2)
+        self.assertEqual(len(response.context["results"]), 2)
+        self.assertEqual(response.context["results"][0].archive_set.count(), 3)
+        self.assertEqual(response.context["results"][1].archive_set.count(), 2)
 
         # Test delete
         response = c.post(
-            reverse('viewer:repeated-archives'),
-            {'del-{}'.format(self.test_gallery1.pk): [self.test_book1b.pk]}
+            reverse("viewer:repeated-archives"), {"del-{}".format(self.test_gallery1.pk): [self.test_book1b.pk]}
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Archive.objects.count(), 5)
-        self.assertEqual(len(response.context['results']), 1)
+        self.assertEqual(len(response.context["results"]), 1)
 
         # Tools page
-        response = c.get(reverse('viewer:tools'))
+        response = c.get(reverse("viewer:tools"))
         self.assertEqual(response.status_code, 200)
 
     def test_main_pages_anonymous(self):
         c = Client()
         # c.login(username='admin1', password='12345')
-        response = c.get(reverse('viewer:archive-search'))
+        response = c.get(reverse("viewer:archive-search"))
         self.assertEqual(response.status_code, 200)
-        response = c.get(reverse('viewer:archive-search'), {'view': 'cover'})
+        response = c.get(reverse("viewer:archive-search"), {"view": "cover"})
         self.assertEqual(response.status_code, 200)
-        response = c.get(reverse('viewer:archive-search'), {'view': 'extended'})
-        self.assertEqual(response.status_code, 200)
-
-        response = c.get(reverse('viewer:gallery-list'))
+        response = c.get(reverse("viewer:archive-search"), {"view": "extended"})
         self.assertEqual(response.status_code, 200)
 
-        response = c.get(reverse('viewer:public-missing-archives'))
+        response = c.get(reverse("viewer:gallery-list"))
         self.assertEqual(response.status_code, 200)
 
-        response = c.get(reverse('viewer:wanted-galleries'))
+        response = c.get(reverse("viewer:public-missing-archives"))
+        self.assertEqual(response.status_code, 200)
+
+        response = c.get(reverse("viewer:wanted-galleries"))
         self.assertEqual(response.status_code, 200)
 
         # Depends on settings.yaml
         # response = c.get(reverse('viewer:url-submit'))
         # self.assertEqual(response.status_code, 200)
 
-        response = c.get(reverse('viewer:about'))
+        response = c.get(reverse("viewer:about"))
         self.assertEqual(response.status_code, 200)
 
     def test_element_pages_anonymous(self):
         c = Client()
         # c.login(username='admin1', password='12345')
         c_normal = Client()
-        c_normal.login(username='testuser1', password='12345')
+        c_normal.login(username="testuser1", password="12345")
         c_staff = Client()
-        c_staff.login(username='admin1', password='12345')
-        response = c.get(reverse('viewer:archive', args=[self.test_book2.pk]))
+        c_staff.login(username="admin1", password="12345")
+        response = c.get(reverse("viewer:archive", args=[self.test_book2.pk]))
         self.assertEqual(response.status_code, 200)
-        response = c.get(reverse('viewer:gallery', args=[self.test_gallery3.pk]))
+        response = c.get(reverse("viewer:gallery", args=[self.test_gallery3.pk]))
         self.assertEqual(response.status_code, 200)
 
-        response = c.get(reverse('viewer:wanted-gallery', args=[self.test_wanted_gallery1.pk]))
+        response = c.get(reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery1.pk]))
         self.assertEqual(response.status_code, 302)
-        response = c_normal.get(reverse('viewer:wanted-gallery', args=[self.test_wanted_gallery1.pk]))
+        response = c_normal.get(reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery1.pk]))
         self.assertEqual(response.status_code, 404)
-        response = c_staff.get(reverse('viewer:wanted-gallery', args=[self.test_wanted_gallery1.pk]))
+        response = c_staff.get(reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery1.pk]))
         self.assertEqual(response.status_code, 200)
-        response = c_staff.get(reverse('viewer:wanted-gallery', args=[99999]))
+        response = c_staff.get(reverse("viewer:wanted-gallery", args=[99999]))
         self.assertEqual(response.status_code, 404)
-        response = c_normal.get(reverse('viewer:wanted-gallery', args=[self.test_wanted_gallery2.pk]))
+        response = c_normal.get(reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery2.pk]))
         self.assertEqual(response.status_code, 200)
+
+    def test_wanted_gallery_permissions_and_aliases(self):
+        from django.contrib.auth.models import Permission
+
+        collab_user = User.objects.create_user(username="collab1", password="12345")
+        perm_view = Permission.objects.get(codename="view_wantedgallery")
+        collab_user.user_permissions.add(perm_view)
+
+        c_collab = Client()
+        c_collab.login(username="collab1", password="12345")
+
+        # Collaborator can view private wanted gallery
+        response = c_collab.get(reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery1.pk]))
+        self.assertEqual(response.status_code, 200)
+
+        # Alias col-wanted-gallery works and renders the same view
+        response = c_collab.get(reverse("viewer:col-wanted-gallery", args=[self.test_wanted_gallery1.pk]))
+        self.assertEqual(response.status_code, 200)
+
+        # Collaborator can access wanted-galleries list
+        response = c_collab.get(reverse("viewer:wanted-galleries"))
+        self.assertEqual(response.status_code, 200)
+
+        # Alias col-wanted-galleries works
+        response = c_collab.get(reverse("viewer:col-wanted-galleries"))
+        self.assertEqual(response.status_code, 200)
+
+        # Anonymous can view wanted-galleries (public list)
+        c_anon = Client()
+        response = c_anon.get(reverse("viewer:wanted-galleries"))
+        self.assertEqual(response.status_code, 200)
+
+        # Collaborator with change permission can edit
+        perm_change = Permission.objects.get(codename="change_wantedgallery")
+        collab_user.user_permissions.add(perm_change)
+        response = c_collab.post(
+            reverse("viewer:wanted-gallery", args=[self.test_wanted_gallery1.pk]),
+            {
+                "submit-wanted-gallery": "Submit",
+                "title": "updated title",
+                "search_title": "sample non",
+                "page_count": 25,
+                "reason": "wanimagazine",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.test_wanted_gallery1.refresh_from_db()
+        self.assertEqual(self.test_wanted_gallery1.title, "updated title")
+
+
+class JsonApiEndpointsTest(GeneralPagesTest):
+    """API handlers: gid, gids, wanted-gallery, wanted-galleries, wanted-galleries-search."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        FoundGallery.objects.create(
+            wanted_gallery=cls.test_wanted_gallery2,
+            gallery=cls.test_gallery3,
+        )
+
+        cls.perm_user_add = User.objects.create_user(username="perm_add", password="12345")
+        cls.perm_user_change = User.objects.create_user(username="perm_change", password="12345")
+        cls.perm_user_delete = User.objects.create_user(username="perm_delete", password="12345")
+        cls.perm_user_all = User.objects.create_user(username="perm_all", password="12345")
+
+        perm_add = Permission.objects.get(codename="add_wantedgallery", content_type__app_label="viewer")
+        perm_change = Permission.objects.get(codename="change_wantedgallery", content_type__app_label="viewer")
+        perm_delete = Permission.objects.get(codename="delete_wantedgallery", content_type__app_label="viewer")
+
+        cls.perm_user_add.user_permissions.add(perm_add)
+        cls.perm_user_change.user_permissions.add(perm_change)
+        cls.perm_user_delete.user_permissions.add(perm_delete)
+        cls.perm_user_all.user_permissions.add(perm_add, perm_change, perm_delete)
+
+    def _api_get(self, client, **params):
+        return client.get(reverse("viewer:api"), params)
+
+    def _api_post(self, client, query_str="", body=None):
+        url = reverse("viewer:api")
+        if query_str:
+            url = f"{url}?{query_str}"
+        return client.post(url, data=json.dumps(body or {}), content_type="application/json")
+
+    def _api_put(self, client, query_str="", body=None):
+        url = reverse("viewer:api")
+        if query_str:
+            url = f"{url}?{query_str}"
+        return client.put(url, data=json.dumps(body or {}), content_type="application/json")
+
+    def _api_delete(self, client, query_str="", body=None):
+        url = reverse("viewer:api")
+        if query_str:
+            url = f"{url}?{query_str}"
+        return client.delete(url, data=json.dumps(body or {}), content_type="application/json")
+
+    def test_api_gid_public_gallery_anonymous(self):
+        response = self._api_get(
+            self.client,
+            gid=self.test_gallery3.gid,
+            provider=self.test_gallery3.provider,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["gid"], self.test_gallery3.gid)
+        self.assertEqual(data["title"], self.test_gallery3.title)
+
+    def test_api_gid_private_gallery_anonymous_returns_404(self):
+        response = self._api_get(
+            self.client,
+            gid=self.test_gallery1.gid,
+            provider=self.test_gallery1.provider,
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("does not exist", json.loads(response.content)["result"])
+
+    def test_api_gid_private_gallery_authenticated(self):
+        client = Client()
+        client.login(username="testuser1", password="12345")
+        response = self._api_get(
+            client,
+            gid=self.test_gallery1.gid,
+            provider=self.test_gallery1.provider,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["gid"], self.test_gallery1.gid)
+
+    def test_api_gids_returns_only_accessible_galleries(self):
+        response = self._api_get(
+            self.client,
+            gids=[self.test_gallery1.gid, self.test_gallery3.gid],
+            provider=self.test_gallery3.provider,
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["gid"], self.test_gallery3.gid)
+
+    def test_api_gids_authenticated_returns_multiple(self):
+        client = Client()
+        client.login(username="testuser1", password="12345")
+        response = self._api_get(
+            client,
+            gids=[self.test_gallery1.gid, self.test_gallery3.gid],
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        gids = {item["gid"] for item in data}
+        self.assertEqual(gids, {self.test_gallery1.gid, self.test_gallery3.gid})
+
+    def test_api_wanted_gallery_public_anonymous(self):
+        response = self._api_get(self.client, **{"wanted-gallery": self.test_wanted_gallery2.pk})
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["id"], self.test_wanted_gallery2.pk)
+        self.assertTrue(data["public"])
+
+    def test_api_wanted_gallery_private_anonymous_returns_404(self):
+        response = self._api_get(self.client, **{"wanted-gallery": self.test_wanted_gallery1.pk})
+        self.assertEqual(response.status_code, 404)
+
+    def test_api_wanted_gallery_private_authenticated(self):
+        client = Client()
+        client.login(username="testuser1", password="12345")
+        response = self._api_get(client, **{"wanted-gallery": self.test_wanted_gallery1.pk})
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["id"], self.test_wanted_gallery1.pk)
+        self.assertFalse(data["public"])
+
+    def test_api_wanted_galleries_by_id(self):
+        client = Client()
+        client.login(username="testuser1", password="12345")
+        response = self._api_get(
+            client,
+            **{
+                "wanted-galleries": [
+                    self.test_wanted_gallery1.pk,
+                    self.test_wanted_gallery2.pk,
+                ]
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        ids = {item["id"] for item in data}
+        self.assertEqual(ids, {self.test_wanted_gallery1.pk, self.test_wanted_gallery2.pk})
+
+    def test_api_wanted_gallery_include_found_galleries(self):
+        response = self._api_get(
+            self.client,
+            **{
+                "wanted-gallery": self.test_wanted_gallery2.pk,
+                "include_found_galleries": "",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(len(data["found_galleries"]), 1)
+        self.assertEqual(data["found_galleries"][0]["gid"], self.test_gallery3.gid)
+
+    def test_api_wanted_gallery_post_create_success(self):
+        client = Client()
+        client.login(username="perm_add", password="12345")
+        payload = {
+            "title": "New Created Wanted Gallery",
+            "title_jpn": "新規募集ギャラリー",
+            "search_title": "Search Query",
+            "should_search": True,
+            "keep_searching": False,
+            "notify_when_found": True,
+            "public": True,
+            "wait_for_time": 300,
+            "wanted_tags": ["artist:new_artist", "female:twintails"],
+            "category": "Manga",
+            "reason": "Test Create",
+        }
+        response = self._api_post(client, "wanted-gallery=", payload)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["result"], "success")
+        self.assertIn("id", data)
+
+        created = WantedGallery.objects.get(pk=data["id"])
+        self.assertEqual(created.title, "New Created Wanted Gallery")
+        self.assertEqual(created.title_jpn, "新規募集ギャラリー")
+        self.assertTrue(created.public)
+        self.assertTrue(created.should_search)
+        self.assertTrue(created.notify_when_found)
+        self.assertEqual(created.wait_for_time.total_seconds(), 300)
+        self.assertIn("artist:new_artist", created.wanted_tags_list())
+
+    def test_api_wanted_gallery_post_unauthorized(self):
+        # Unauthenticated
+        response = self._api_post(self.client, "wanted-gallery=", {"title": "Denied"})
+        self.assertEqual(response.status_code, 403)
+
+        # Authenticated but missing add_wantedgallery permission
+        client = Client()
+        client.login(username="testuser1", password="12345")
+        response = self._api_post(client, "wanted-gallery=", {"title": "Denied"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_api_wanted_gallery_put_modify_success(self):
+        client = Client()
+        client.login(username="perm_change", password="12345")
+        payload = {
+            "title": "Modified Title Put",
+            "should_search": False,
+            "public": True,
+            "notify_when_found": True,
+            "wait_for_time": 600,
+            "wanted_tags": ["artist:updated_artist"],
+            "reason": "Updated Reason",
+        }
+        response = self._api_put(client, f"wanted-gallery={self.test_wanted_gallery1.pk}", payload)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["result"], "success")
+        self.assertEqual(data["id"], self.test_wanted_gallery1.pk)
+        self.assertEqual(data["title"], "Modified Title Put")
+        self.assertTrue(data["public"])
+        self.assertFalse(data["should_search"])
+        self.assertEqual(data["wait_for_time"], 600)
+        self.assertIn("artist:updated_artist", data["wanted_tags"])
+
+        self.test_wanted_gallery1.refresh_from_db()
+        self.assertEqual(self.test_wanted_gallery1.title, "Modified Title Put")
+        self.assertTrue(self.test_wanted_gallery1.public)
+        self.assertFalse(self.test_wanted_gallery1.should_search)
+        self.assertEqual(self.test_wanted_gallery1.wait_for_time.total_seconds(), 600)
+        self.assertIn("artist:updated_artist", self.test_wanted_gallery1.wanted_tags_list())
+
+    def test_api_wanted_gallery_put_modify_partial(self):
+        client = Client()
+        client.login(username="perm_change", password="12345")
+        original_title = self.test_wanted_gallery2.title
+        payload = {"should_search": False}
+        response = self._api_put(client, f"wanted-gallery={self.test_wanted_gallery2.pk}", payload)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["title"], original_title)
+        self.assertFalse(data["should_search"])
+
+        self.test_wanted_gallery2.refresh_from_db()
+        self.assertEqual(self.test_wanted_gallery2.title, original_title)
+        self.assertFalse(self.test_wanted_gallery2.should_search)
+
+    def test_api_wanted_gallery_put_with_id_in_body(self):
+        client = Client()
+        client.login(username="perm_change", password="12345")
+        payload = {
+            "id": self.test_wanted_gallery2.pk,
+            "reason": "Updated Reason Via Body ID",
+        }
+        response = self._api_put(client, "wanted-gallery=", payload)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["reason"], "Updated Reason Via Body ID")
+
+        self.test_wanted_gallery2.refresh_from_db()
+        self.assertEqual(self.test_wanted_gallery2.reason, "Updated Reason Via Body ID")
+
+    def test_api_wanted_gallery_put_not_found(self):
+        client = Client()
+        client.login(username="perm_change", password="12345")
+        response = self._api_put(client, "wanted-gallery=999999", {"title": "Non-existent"})
+        self.assertEqual(response.status_code, 404)
+        data = json.loads(response.content)
+        self.assertIn("does not exist", data["result"])
+
+    def test_api_wanted_gallery_put_unauthorized(self):
+        # Unauthenticated
+        response = self._api_put(self.client, f"wanted-gallery={self.test_wanted_gallery1.pk}", {"title": "Denied"})
+        self.assertEqual(response.status_code, 403)
+
+        # Authenticated without change_wantedgallery
+        client = Client()
+        client.login(username="perm_add", password="12345")
+        response = self._api_put(client, f"wanted-gallery={self.test_wanted_gallery1.pk}", {"title": "Denied"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_api_wanted_gallery_delete_success(self):
+        temp = WantedGallery.objects.create(title="To be deleted", public=True)
+        temp_pk = temp.pk
+
+        client = Client()
+        client.login(username="perm_delete", password="12345")
+        response = self._api_delete(client, f"wanted-gallery={temp_pk}")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["result"], "success")
+        self.assertEqual(data["id"], temp_pk)
+        self.assertFalse(WantedGallery.objects.filter(pk=temp_pk).exists())
+
+    def test_api_wanted_gallery_delete_not_found_and_unauthorized(self):
+        # Unauthenticated
+        response = self._api_delete(self.client, f"wanted-gallery={self.test_wanted_gallery1.pk}")
+        self.assertEqual(response.status_code, 403)
+
+        # Authorized but not found
+        client = Client()
+        client.login(username="perm_delete", password="12345")
+        response = self._api_delete(client, "wanted-gallery=999999")
+        self.assertEqual(response.status_code, 404)
+
+    def test_api_wanted_galleries_search_include_found_galleries(self):
+        response = self._api_get(
+            self.client,
+            **{
+                "wanted-galleries-search": "",
+                "title": "public gallery",
+                "include_found_galleries": "",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertGreaterEqual(len(data), 1)
+        found_entry = next((item for item in data if item["id"] == self.test_wanted_gallery2.pk), None)
+        self.assertIsNotNone(found_entry)
+        self.assertIn("found_galleries", found_entry)
+        self.assertEqual(len(found_entry["found_galleries"]), 1)
+        self.assertEqual(found_entry["found_galleries"][0]["gid"], self.test_gallery3.gid)
+
+
+class JsonParserWebcrawlerTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from django.contrib.auth.models import Permission, User
+        cls.api_user = User.objects.create_user(username="api_user_json", password="password")
+        perm = Permission.objects.get(codename="use_remote_api", content_type__app_label="viewer")
+        cls.api_user.user_permissions.add(perm)
+
+        cls.unauthorized_user = User.objects.create_user(username="unauth_user_json", password="password")
+
+    def setUp(self):
+        from django.test import Client
+        self.client = Client()
+        self.client.login(username="api_user_json", password="password")
+
+    def _post_json_parser(self, body, client=None):
+        c = client or self.client
+        return c.post(
+            reverse("viewer:jsonapi"),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+    def test_unauthorized_user_rejected(self):
+        from django.test import Client
+        unauth_client = Client()
+        unauth_client.login(username="unauth_user_json", password="password")
+        response = self._post_json_parser(
+            {"operation": "webcrawler", "args": {"link": "https://example.com/1"}},
+            client=unauth_client,
+        )
+        self.assertEqual(response.status_code, 401)
+        data = json.loads(response.content)
+        self.assertEqual(data["error"], "Not authorized")
+
+    def test_single_link_argument(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"link": "https://example.com/test1"}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling: https://example.com/test1", data["message"])
+            self.assertEqual(data["result"], "1")
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertEqual(call_kwargs["args"], ["https://example.com/test1"])
+            self.assertEqual(call_kwargs["task_type"], "web_crawler")
+
+    def test_multiple_links_argument(self):
+        from unittest.mock import patch
+        links = ["https://example.com/test1", "https://example.com/test2", "https://example.com/test3"]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling: 3 links", data["message"])
+            self.assertEqual(data["result"], "3")
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertEqual(call_kwargs["args"], links)
+            self.assertEqual(call_kwargs["task_type"], "web_crawler")
+
+    def test_single_link_in_links_argument(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": ["https://example.com/single"]}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling: https://example.com/single", data["message"])
+            self.assertEqual(data["result"], "1")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(mock_enqueue.call_args.kwargs["args"], ["https://example.com/single"])
+
+    def test_multiple_links_string_argument(self):
+        from unittest.mock import patch
+        links_str = "https://example.com/str1\nhttps://example.com/str2"
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links_str}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling: 2 links", data["message"])
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(
+                mock_enqueue.call_args.kwargs["args"],
+                ["https://example.com/str1", "https://example.com/str2"],
+            )
+
+    def test_combined_link_and_links_arguments(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": {
+                        "link": "https://example.com/link_arg",
+                        "links": ["https://example.com/links_arg"],
+                    },
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(
+                mock_enqueue.call_args.kwargs["args"],
+                ["https://example.com/links_arg", "https://example.com/link_arg"],
+            )
+
+    def test_multiple_links_with_reason(self):
+        from unittest.mock import patch
+        links = ["https://example.com/1", "https://example.com/2"]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links, "reason": "test_reason"}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(
+                mock_enqueue.call_args.kwargs["args"],
+                ["https://example.com/1", "https://example.com/2", "-reason", "test_reason"],
+            )
+            self.assertEqual(mock_enqueue.call_args.kwargs["reason"], "test_reason")
+
+    def test_multiple_links_with_downloader(self):
+        from unittest.mock import patch
+        links = ["https://example.com/1", "https://example.com/2"]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links, "downloader": "default"}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(mock_enqueue.call_args.kwargs["args"], links)
+
+    def test_empty_links_returns_error(self):
+        response = self._post_json_parser(
+            {"operation": "webcrawler", "args": {"links": []}}
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["error"], "No links provided")
+
+    def test_missing_link_and_links_returns_error(self):
+        response = self._post_json_parser(
+            {"operation": "webcrawler", "args": {}}
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data["error"], "No links provided")
+
+    def test_multiple_links_some_exist_in_database(self):
+        gallery = Gallery.objects.create(title="Existing gallery", gid="999991", provider="panda")
+        Archive.objects.create(title="Existing Archive", user=self.api_user, gallery=gallery)
+
+        from unittest.mock import patch
+        links = [
+            "https://e-hentai.org/g/999991/token1/",
+            "https://e-hentai.org/g/999992/token2/",
+        ]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling 2 links (1 archives exist, checking for redownload)", data["message"])
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(mock_enqueue.call_args.kwargs["args"], links)
+
+    def test_multiple_links_all_exist_in_database(self):
+        gallery1 = Gallery.objects.create(title="Existing 1", gid="999993", provider="panda")
+        Archive.objects.create(title="Archive 1", user=self.api_user, gallery=gallery1)
+        gallery2 = Gallery.objects.create(title="Existing 2", gid="999994", provider="panda")
+        Archive.objects.create(title="Archive 2", user=self.api_user, gallery=gallery2)
+
+        from unittest.mock import patch
+        links = [
+            "https://e-hentai.org/g/999993/token1/",
+            "https://e-hentai.org/g/999994/token2/",
+        ]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {"operation": "webcrawler", "args": {"links": links}}
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Archive exists, crawling to check for redownload: 2 links", data["message"])
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+
+    def test_multiple_links_parent_link_confirm_deletion(self):
+        parent_gallery = Gallery.objects.create(
+            title="Parent Gallery", gid="888881", token="ptok", provider="panda"
+        )
+        Archive.objects.create(title="Parent Archive", user=self.api_user, gallery=parent_gallery)
+
+        links = ["https://e-hentai.org/g/777771/tok1/", "https://e-hentai.org/g/777772/tok2/"]
+        response = self._post_json_parser(
+            {
+                "operation": "webcrawler",
+                "args": {
+                    "links": links,
+                    "parentLink": "https://e-hentai.org/g/888881/ptok/",
+                },
+            }
+        )
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertEqual(data.get("action"), "confirmDeletion")
+        self.assertIn("Please confirm deletion of parent", data["message"])
+
+    def test_multiple_links_parent_link_queue_found(self):
+        parent_gallery = Gallery.objects.create(
+            title="Parent Gallery", gid="888882", token="ptok2", provider="panda"
+        )
+        Archive.objects.create(title="Parent Archive", user=self.api_user, gallery=parent_gallery)
+
+        from unittest.mock import patch
+        links = ["https://e-hentai.org/g/777773/tok3/", "https://e-hentai.org/g/777774/tok4/"]
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": {
+                        "links": links,
+                        "parentLink": "https://e-hentai.org/g/888882/ptok2/",
+                        "action": "queueFound",
+                    },
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content)
+            self.assertIn("Crawling: 2 links, keeping parent", data["message"])
+            self.assertEqual(data["result"], "2")
+            mock_enqueue.assert_called_once()
+            self.assertEqual(mock_enqueue.call_args.kwargs["args"], links)
+
+    def test_ignore_global_filters_snake_case(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": {
+                        "link": "https://example.com/test1",
+                        "ignore_global_filters": True,
+                    },
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertIn("https://example.com/test1", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+    def test_ignore_global_filters_kebab_case(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": {
+                        "links": ["https://example.com/test1"],
+                        "ignore-global-filters": True,
+                    },
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+    def test_ignore_global_filters_top_level_flag(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": ["https://example.com/test1"],
+                    "ignore_global_filters": True,
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+    def test_ignore_global_filters_with_downloader(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            response = self._post_json_parser(
+                {
+                    "operation": "webcrawler",
+                    "args": {
+                        "link": "https://example.com/test1",
+                        "downloader": "fake",
+                        "ignore_global_filters": True,
+                    },
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            mock_enqueue.assert_called_once()
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+    def test_ignore_global_filters_other_operations(self):
+        from unittest.mock import patch
+        with patch("workers.client.enqueue") as mock_enqueue:
+            # Operation: links
+            response = self._post_json_parser(
+                {
+                    "operation": "links",
+                    "args": ["https://example.com/link1"],
+                    "ignore_global_filters": True,
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+            mock_enqueue.reset_mock()
+            # Operation: force_queue_archives
+            response = self._post_json_parser(
+                {
+                    "operation": "force_queue_archives",
+                    "args": ["https://example.com/fq1"],
+                    "ignore_global_filters": True,
+                }
+            )
+            self.assertEqual(response.status_code, 200)
+            call_kwargs = mock_enqueue.call_args.kwargs
+            self.assertIn("--ignore-global-filters", call_kwargs["args"])
+            self.assertTrue(call_kwargs["override_options"].ignore_global_filters)
+
+
+class OperationalFixesTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.admin_user = User.objects.create_user(username="admin_op", password="password")
+        cls.admin_user.is_staff = True
+        cls.admin_user.save()
+
+        cls.super_user = User.objects.create_superuser(
+            username="super_op", email="super@example.com", password="password"
+        )
+
+        cls.normal_user = User.objects.create_user(username="user_op", password="password")
+
+        cls.archive_without_thumb = Archive.objects.create(
+            title="Archive No Thumb",
+            user=cls.admin_user,
+            public=True,
+        )
+        cls.gallery_without_thumb = Gallery.objects.create(
+            title="Gallery No Thumb",
+            gid="99901",
+            provider="test",
+            public=True,
+        )
+
+    def test_admin_api_status_code_unauthorized_and_invalid(self):
+        c = Client()
+        # 1. Anonymous user to tools-api -> 401
+        response = c.get(reverse("viewer:tools-api", args=["main"]))
+        self.assertEqual(response.status_code, 401)
+        data = json.loads(response.content)
+        self.assertEqual(data.get("error"), "Not allowed")
+
+        # 2. Non-staff user to tools-api -> 401
+        c.login(username="user_op", password="password")
+        response = c.get(reverse("viewer:tools-api", args=["main"]))
+        self.assertEqual(response.status_code, 401)
+        data = json.loads(response.content)
+        self.assertEqual(data.get("error"), "Not allowed")
+
+        # 3. Staff user with invalid arguments -> 401
+        c_staff = Client()
+        c_staff.login(username="admin_op", password="password")
+        self.assertEqual(c_staff.get(reverse("viewer:tools-api", args=["update_newer_than"])).status_code, 405)
+        response = c_staff.post(reverse("viewer:tools-api", args=["update_newer_than"]), data={"newer_than": "invalid-date"})
+        self.assertEqual(response.status_code, 401)
+        data = json.loads(response.content)
+        self.assertEqual(data.get("error"), "Invalid date format.")
+
+        self.assertEqual(c_staff.get(reverse("viewer:tools-api", args=["update_missing_thumbnails"])).status_code, 405)
+        response = c_staff.post(reverse("viewer:tools-api", args=["update_missing_thumbnails"]), data={"limit_number": "notanumber"})
+        self.assertEqual(response.status_code, 401)
+        data = json.loads(response.content)
+        self.assertEqual(data.get("error"), "Invalid limit.")
+
+        # 4. Staff user accessing config_schema and default_config
+        response = c_staff.get(reverse("viewer:tools-api", args=["config_schema"]))
+        self.assertEqual(response.status_code, 200)
+        schema_data = json.loads(response.content)
+        self.assertIn("properties", schema_data)
+        self.assertIn("general", schema_data["properties"])
+
+        response = c_staff.get(reverse("viewer:tools-api", args=["default_config"]))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Panda Backup", response.content)
+
+        # 5. Validate settings endpoint tests (restricted to superusers; non-superuser staff get 403)
+        valid_yaml = "general:\n  wait_timer: 2.5\nlocations:\n  media_root: '/tmp/media'\n"
+        for tool_name in ("settings", "validate_settings", "reload_settings"):
+            resp_staff = c_staff.post(
+                reverse("viewer:tools-api", args=[tool_name]),
+                data=json.dumps({"data": valid_yaml}),
+                content_type="application/json",
+            )
+            self.assertEqual(resp_staff.status_code, 403)
+            self.assertEqual(json.loads(resp_staff.content).get("error"), "Superuser required")
+
+        c_super = Client()
+        c_super.login(username="super_op", password="password")
+
+        # 5a. Valid YAML
+        response = c_super.post(
+            reverse("viewer:tools-api", args=["validate_settings"]),
+            data=json.dumps({"data": valid_yaml}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        val_data = json.loads(response.content)
+        self.assertTrue(val_data["valid"])
+        self.assertEqual(len(val_data["annotations"]), 0)
+
+        # 5b. Syntax error
+        syntax_bad_yaml = "general:\n  wait_timer: ["
+        response = c_super.post(
+            reverse("viewer:tools-api", args=["validate_settings"]),
+            data=json.dumps({"data": syntax_bad_yaml}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        val_data = json.loads(response.content)
+        self.assertFalse(val_data["valid"])
+        self.assertGreater(len(val_data["annotations"]), 0)
+        self.assertIn("syntax", val_data["errors"][0]["loc"].lower())
+
+        # 5c. Schema error (invalid type: wait_timer should be number)
+        schema_bad_yaml = "general:\n  wait_timer: 'not-a-number'\n"
+        response = c_super.post(
+            reverse("viewer:tools-api", args=["validate_settings"]),
+            data=json.dumps({"data": schema_bad_yaml}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        val_data = json.loads(response.content)
+        self.assertFalse(val_data["valid"])
+        self.assertGreater(len(val_data["annotations"]), 0)
+        self.assertIn("wait_timer", val_data["annotations"][0]["text"])
+
+        # 5d. Settings POST with schema error without force fails with 400
+        response = c_super.post(
+            reverse("viewer:tools-api", args=["settings"]),
+            data=json.dumps({"data": schema_bad_yaml}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        save_err = json.loads(response.content)
+        self.assertIn("error", save_err)
+
+        # 5e. Settings POST with schema error with force=True succeeds
+        from django.conf import settings as dj_settings
+        c_settings = dj_settings.CRAWLER_SETTINGS
+        settings_file = os.path.join(c_settings.default_dir, "settings.yaml")
+        original_settings = None
+        if os.path.isfile(settings_file):
+            with open(settings_file, "r", encoding="utf-8") as f:
+                original_settings = f.read()
+        try:
+            response = c_super.post(
+                reverse("viewer:tools-api", args=["settings"]),
+                data=json.dumps({"data": schema_bad_yaml, "force": True}),
+                content_type="application/json",
+            )
+            self.assertEqual(response.status_code, 200)
+        finally:
+            if original_settings is not None:
+                with open(settings_file, "w", encoding="utf-8") as f:
+                    f.write(original_settings)
+
+    def test_thumbnail_missing_fallback(self):
+        c = Client()
+        # Archive with no thumbnail file
+        response = c.get(reverse("viewer:archive-thumb", args=[self.archive_without_thumb.pk]))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/static/imgs/no_cover.png", response.url)
+
+        # Gallery with no thumbnail file
+        response = c.get(reverse("viewer:gallery-thumb", args=[self.gallery_without_thumb.pk]))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/static/imgs/no_cover.png", response.url)
+
+    def test_elasticsearch_views_empty_json_response(self):
+        from unittest.mock import patch
+        from viewer.views.elasticsearch import (
+            autocomplete_view,
+            title_suggest_view,
+            title_suggest_archive_view,
+        )
+        from django.test.client import RequestFactory
+
+        rf = RequestFactory()
+        req = rf.get("/elasticsearch/autocomplete/?q=test")
+
+        with patch("viewer.views.elasticsearch.settings.ES_ENABLED", False):
+            resp = autocomplete_view(req)
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.headers.get("Content-Type", "").startswith("application/json"))
+            self.assertEqual(json.loads(resp.content), {})
+
+            resp = title_suggest_view(req)
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.headers.get("Content-Type", "").startswith("application/json"))
+            self.assertEqual(json.loads(resp.content), {})
+
+            resp = title_suggest_archive_view(req)
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.headers.get("Content-Type", "").startswith("application/json"))
+            self.assertEqual(json.loads(resp.content), {})
+
+    def test_cloning_image_tool_no_shell_injection(self):
+        from unittest.mock import MagicMock, patch
+        from viewer.services.archive_cloning import ArchiveCloningService
+
+        malicious_input = "/tmp/dir/$(touch /tmp/pwned); rm -rf / --input.jpg"
+        output_path = "/tmp/dir/mod_file_1.tmp"
+        cmd = ArchiveCloningService.build_image_tool_command(
+            "convert -quality 90 {input} {output}",
+            malicious_input,
+            output_path,
+        )
+        self.assertEqual(cmd, ["convert", "-quality", "90", malicious_input, output_path])
+
+        with self.assertRaises(ValueError):
+            ArchiveCloningService.build_image_tool_command("   ", malicious_input, output_path)
+
+        tool = MagicMock()
+        tool.name = "test-tool"
+        tool.executable_path = "convert {input} {output}"
+        with patch("viewer.services.archive_cloning.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            err = ArchiveCloningService.run_image_tool(tool, malicious_input, output_path)
+            self.assertIsNone(err)
+            mock_run.assert_called_once()
+            called_args, called_kwargs = mock_run.call_args
+            self.assertEqual(called_args[0], ["convert", malicious_input, output_path])
+            self.assertFalse(called_kwargs.get("shell", True))
+
+    def test_secret_key_resolution(self):
+        from core.base.secret_key import INSECURE_SECRET_KEYS, resolve_secret_key
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            known_default = next(iter(INSECURE_SECRET_KEYS))
+            generated = resolve_secret_key(known_default, tmpdir)
+            self.assertNotIn(generated, INSECURE_SECRET_KEYS)
+            self.assertGreaterEqual(len(generated), 50)
+            # Subsequent calls reuse the persisted key file
+            self.assertEqual(resolve_secret_key("", tmpdir), generated)
+            # Custom keys are preserved as-is
+            self.assertEqual(resolve_secret_key("my-custom-operator-secret-key", tmpdir), "my-custom-operator-secret-key")
+
+    def test_gallery_comment_xss_escaped(self):
+        xss_gallery = Gallery.objects.create(
+            title="XSS Gallery",
+            gid="99902",
+            provider="test",
+            comment="<script>alert('xss')</script>\nSecond line",
+            public=True,
+        )
+        c = Client()
+        for url in (
+            reverse("viewer:gallery", args=[xss_gallery.pk]),
+            reverse("viewer:gallery", args=[xss_gallery.pk]) + "?view_style=new",
+        ):
+            resp = c.get(url)
+            self.assertEqual(resp.status_code, 200)
+            self.assertNotIn(b"<script>alert('xss')</script>", resp.content)
+            self.assertIn(b"&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;<br>Second line", resp.content)
+
+    def test_jal_text_widget_xss_escaped(self):
+        from viewer.forms import JalTextWidget
+
+        widget = JalTextWidget(url="tag-pk-autocomplete")
+        rendered = str(
+            widget.render(
+                "tags",
+                '"><script>alert(1)</script>',
+                attrs={"id": 'id_tags" onclick="alert(2)'},
+            )
+        )
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
+        self.assertNotIn('onclick="alert(2)"', rendered)
+        self.assertIn('autocomplete="off"', rendered)
+
+    def test_settings_views_superuser_and_redaction(self):
+        from viewer.templatetags.viewer_extras import format_setting_value
+
+        c_staff = Client()
+        c_staff.login(username="admin_op", password="password")
+
+        for url in (
+            reverse("viewer:stats-settings"),
+            reverse("viewer:tools-id", args=["modify_settings_editor"]),
+        ):
+            resp = c_staff.get(url, follow=True)
+            self.assertIn(b"superuser", resp.content)
+
+        resp = c_staff.post(reverse("viewer:tools-id", args=["reload_settings"]), follow=True)
+        self.assertIn(b"superuser", resp.content)
+
+        c_super = Client()
+        c_super.login(username="super_op", password="password")
+        resp = c_super.get(reverse("viewer:tools-id", args=["modify_settings_editor"]))
+        self.assertEqual(resp.status_code, 200)
+
+        formatted = dict(
+            format_setting_value(
+                {
+                    "django_secret_key": "top-secret-value",
+                    "database": {"postgresql_password": "db-pass", "postgresql_user": "panda"},
+                    "config": {"general": {"django_secret_key": "raw"}},
+                    "wait_timer": 2.5,
+                }
+            )
+        )
+        self.assertEqual(formatted["django_secret_key"], "***REDACTED***")
+        self.assertEqual(formatted["database"]["postgresql_password"], "***REDACTED***")
+        self.assertEqual(formatted["database"]["postgresql_user"], "panda")
+        self.assertEqual(formatted["config"], "***REDACTED***")
+        self.assertEqual(formatted["wait_timer"], 2.5)
+
+
+_TEMP_MEDIA_DIR = tempfile.mkdtemp(prefix="panda_test_media_")
+
+
+@override_settings(MEDIA_ROOT=_TEMP_MEDIA_DIR)
+class GalleryAndArchiveViewsTest(TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        shutil.rmtree(_TEMP_MEDIA_DIR, ignore_errors=True)
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.test_admin = User.objects.create_user(username="test_admin_views", password="password123", is_staff=True)
+        cls.test_user = User.objects.create_user(username="test_user_views", password="password123")
+
+        small_gif = (
+            b'\x47\x49\x46\x38\x39\x61\x01\x00\x01\x00\x00\x00\x00\x21\xf9\x04'
+            b'\x01\x0a\x00\x01\x00\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02'
+            b'\x02\x4c\x01\x00\x3b'
+        )
+        thumb_file1 = SimpleUploadedFile("thumb1.gif", small_gif, content_type="image/gif")
+        thumb_file2 = SimpleUploadedFile("thumb2.gif", small_gif, content_type="image/gif")
+
+        cls.gallery_public = Gallery.objects.create(
+            title="Sample Public Gallery",
+            gid="1001",
+            provider="panda",
+            category="Manga",
+            public=True,
+            rating=4.5,
+            comment="This is a test comment",
+            thumbnail=thumb_file1,
+        )
+        cls.gallery_private = Gallery.objects.create(
+            title="Sample Private Gallery",
+            gid="1002",
+            provider="panda",
+            category="Non-H",
+            public=False,
+            disowned=True,
+            expunged=True,
+        )
+
+        cls.archive_public = Archive.objects.create(
+            title="Sample Public Archive",
+            user=cls.test_admin,
+            public=True,
+            gallery=cls.gallery_public,
+            crc32="ABCD1234",
+            filecount=10,
+            filesize=1048576,
+            thumbnail=thumb_file2,
+        )
+        cls.archive_private = Archive.objects.create(
+            title="Sample Private Archive",
+            user=cls.test_admin,
+            public=False,
+            gallery=cls.gallery_private,
+            crc32="EFGH5678",
+            filecount=5,
+            filesize=524288,
+        )
+
+    def test_gallery_view_anonymous_public(self):
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Sample Public Gallery")
+        self.assertContains(resp, "Public")
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+        self.assertNotContains(resp, "inline-cover-container")
+
+    def test_gallery_view_anonymous_private_redirect_or_404(self):
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_private.pk]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_gallery_view_authenticated_private(self):
+        self.client.login(username="test_user_views", password="password123")
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_private.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Sample Private Gallery")
+        self.assertContains(resp, "Disowned")
+        self.assertContains(resp, "Expunged")
+
+    def test_archive_view_anonymous_public(self):
+        resp = self.client.get(reverse("viewer:archive", args=[self.archive_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Sample Public Archive")
+        self.assertContains(resp, "ABCD1234")
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+        self.assertNotContains(resp, "inline-cover-container")
+
+    def test_archive_view_anonymous_private_404(self):
+        resp = self.client.get(reverse("viewer:archive", args=[self.archive_private.pk]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_archive_view_authenticated_private(self):
+        self.client.login(username="test_user_views", password="password123")
+        resp = self.client.get(reverse("viewer:archive", args=[self.archive_private.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Sample Private Archive")
+        self.assertContains(resp, "EFGH5678")
+
+    def test_refined_views_opt_in_routing(self):
+        # 1. By default, views route to the old/legacy templates:
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+
+        resp = self.client.get(reverse("viewer:archive", args=[self.archive_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+
+        # 2. When ?view_style=new is explicitly passed, views route to the new templates:
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]) + "?view_style=new")
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "btn-toggle-inline-cover")
+        self.assertContains(resp, "inline-cover-container")
+
+        resp = self.client.get(reverse("viewer:archive", args=[self.archive_public.pk]) + "?view_style=new")
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "btn-toggle-inline-cover")
+        self.assertContains(resp, "inline-cover-container")
+
+        # 3. Refreshing or requesting without ?view_style=new reverts to old design (stateless GET param):
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]) + "?view_style=old")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+
+        # 4. Authenticated users follow the exact same GET param behavior:
+        self.client.login(username="test_user_views", password="password123")
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "btn-toggle-inline-cover")
+
+        resp = self.client.get(reverse("viewer:gallery", args=[self.gallery_public.pk]) + "?view_style=new")
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "btn-toggle-inline-cover")
+        self.assertContains(resp, "inline-cover-container")
+
+
+class TemplateTagsTest(TestCase):
+    def test_boolean_badge_defaults(self):
+        from viewer.templatetags.viewer_extras import boolean_badge
+        self.assertIn("bg-success", boolean_badge(True))
+        self.assertIn("Yes", boolean_badge(True))
+        self.assertIn("bg-secondary", boolean_badge(False))
+        self.assertIn("No", boolean_badge(False))
+
+    def test_boolean_badge_custom_labels(self):
+        from viewer.templatetags.viewer_extras import boolean_badge
+        res = boolean_badge(True, "Public,Private")
+        self.assertIn("bg-success", res)
+        self.assertIn("Public", res)
+
+        res_false = boolean_badge(False, "Public,Private")
+        self.assertIn("bg-secondary", res_false)
+        self.assertIn("Private", res_false)
+
+    def test_boolean_badge_danger(self):
+        from viewer.templatetags.viewer_extras import boolean_badge
+        res = boolean_badge(True, "danger")
+        self.assertIn("bg-danger", res)
+        self.assertIn("Yes", res)
+
+        res_custom = boolean_badge(True, "Expunged,Active,danger")
+        self.assertIn("bg-danger", res_custom)
+        self.assertIn("Expunged", res_custom)
+
+    def test_boolean_text(self):
+        from viewer.templatetags.viewer_extras import boolean_text
+        self.assertIn("text-success", boolean_text(True))
+        self.assertIn("text-secondary", boolean_text(False))
+        self.assertIn("text-danger", boolean_text(True, "danger"))
+
+
+class ToolsSettingsTestCase(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.admin_user = User.objects.create_superuser(
+            username="admin_tools",
+            email="admin_tools@example.com",
+            password="testpassword",
+        )
+        self.normal_user = User.objects.create_user(
+            username="normal_tools",
+            email="normal_tools@example.com",
+            password="testpassword",
+        )
+
+    def test_tools_page_links_editor_only(self):
+        self.client.login(username="admin_tools", password="testpassword")
+        resp = self.client.get(reverse("viewer:tools"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, reverse("viewer:tools-id", args=["modify_settings_editor"]))
+        self.assertNotContains(resp, reverse("viewer:tools-id", args=["modify_settings"]))
+        self.assertNotContains(resp, "settings_file")
+
+    def test_modify_settings_redirects_to_editor(self):
+        self.client.login(username="admin_tools", password="testpassword")
+        resp = self.client.get(reverse("viewer:tools-id", args=["modify_settings"]))
+        self.assertEqual(resp.status_code, 302)
+        self.assertRedirects(resp, reverse("viewer:tools-id", args=["modify_settings_editor"]))
+
+    def test_modify_settings_editor_renders_settings_page(self):
+        self.client.login(username="admin_tools", password="testpassword")
+        resp = self.client.get(reverse("viewer:tools-id", args=["modify_settings_editor"]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertTemplateUsed(resp, "viewer/settings.html")
+
+
+class LoginSecurityTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.active_user = User.objects.create_user(
+            username="active_user",
+            password="testpassword123",
+        )
+        cls.disabled_user = User.objects.create_user(
+            username="disabled_user",
+            password="testpassword123",
+            is_active=False,
+        )
+
+    def test_login_success_safe_relative_next(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "testpassword123", "next": "/galleries/"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, "/galleries/")
+
+    def test_login_success_unsafe_external_next_redirects_to_fallback(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "testpassword123", "next": "https://evil.com/phishing"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, reverse("viewer:main-page"))
+
+    def test_login_success_unsafe_scheme_relative_next_redirects_to_fallback(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "testpassword123", "next": "//evil.com"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, reverse("viewer:main-page"))
+
+    def test_login_success_unsafe_javascript_next_redirects_to_fallback(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "testpassword123", "next": "javascript:alert(1)"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, reverse("viewer:main-page"))
+
+    def test_login_success_missing_next_redirects_to_fallback(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "testpassword123"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.url, reverse("viewer:main-page"))
+
+    def test_login_malformed_post_missing_fields_does_not_500(self):
+        resp = self.client.post(reverse("viewer:login"), {})
+        self.assertIn(resp.status_code, (200, 302))
+
+        resp2 = self.client.post(reverse("viewer:login"), {"username": "active_user"})
+        self.assertIn(resp2.status_code, (200, 302))
+
+        resp3 = self.client.post(reverse("viewer:login"), {"password": "testpassword123"})
+        self.assertIn(resp3.status_code, (200, 302))
+
+    def test_login_disabled_user(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "disabled_user", "password": "testpassword123"},
+        )
+        self.assertEqual(resp.status_code, 302)
+
+    def test_login_invalid_credentials(self):
+        resp = self.client.post(
+            reverse("viewer:login"),
+            {"username": "active_user", "password": "wrongpassword"},
+        )
+        self.assertEqual(resp.status_code, 302)
+
+    def test_login_get_safe_next(self):
+        resp = self.client.get(reverse("viewer:login"), {"next": "/galleries/"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.context["next"], "/galleries/")
+
+    def test_login_get_unsafe_next_sanitized(self):
+        resp = self.client.get(reverse("viewer:login"), {"next": "https://evil.com"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.context["next"], "")
+
+
+class PostOnlyEndpointsTestCase(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_superuser(
+            username="super_post_only",
+            email="super_post@example.com",
+            password="testpassword",
+        )
+        self.client.login(username="super_post_only", password="testpassword")
+        self.archive = Archive.objects.create(
+            title="Test Archive",
+            user=self.user,
+            crc32="12345678",
+        )
+        self.manage_entry = ArchiveManageEntry.objects.create(
+            archive=self.archive,
+            mark_user=self.user,
+            mark_reason="Test Mark",
+        )
+
+    def test_api_logout_requires_post(self):
+        # GET should be rejected with 405 Method Not Allowed
+        resp_get = self.client.get(reverse("viewer:api-logout"))
+        self.assertEqual(resp_get.status_code, 405)
+
+        # POST should succeed
+        resp_post = self.client.post(reverse("viewer:api-logout"))
+        self.assertEqual(resp_post.status_code, 200)
+        data = json.loads(resp_post.content)
+        self.assertTrue(data.get("success"))
+
+    def test_archive_endpoints_require_post(self):
+        post_only_urls = [
+            reverse("viewer:archive-public", args=[self.archive.pk]),
+            reverse("viewer:archive-private", args=[self.archive.pk]),
+            reverse("viewer:archive-recalc-info", args=[self.archive.pk]),
+            reverse("viewer:archive-recall-api", args=[self.archive.pk]),
+            reverse("viewer:archive-rematch", args=[self.archive.pk]),
+            reverse("viewer:archive-calc-imgs-sha1", args=[self.archive.pk]),
+            reverse("viewer:archive-manage-delete", args=[self.manage_entry.pk]),
+            reverse("viewer:archive-manage-remove-from-index", args=[self.manage_entry.pk]),
+            reverse("viewer:archive-manage-add-to-index", args=[self.manage_entry.pk]),
+        ]
+
+        for url in post_only_urls:
+            resp = self.client.get(url, HTTP_REFERER="/archive/")
+            self.assertEqual(resp.status_code, 405, f"Expected 405 for GET on {url}, got {resp.status_code}")
+
+    def test_admin_tools_actions_require_post(self):
+        mutating_tools = [
+            "retry_failed",
+            "generate_missing_thumbs",
+            "calculate_missing_info",
+            "recalc_all_file_info",
+            "set_all_hidden_as_public",
+            "regenerate_all_thumbs",
+            "clear_all_archive_possible_matches",
+            "restart_viewer",
+            "restart_workers",
+            "reload_settings",
+        ]
+
+        for tool in mutating_tools:
+            resp_view = self.client.get(reverse("viewer:tools-id", args=[tool]), HTTP_REFERER="/tools/")
+            self.assertEqual(resp_view.status_code, 405, f"Expected 405 for GET on tools-id {tool}, got {resp_view.status_code}")
+
+            resp_api = self.client.get(reverse("viewer:tools-api", args=[tool]))
+            self.assertEqual(resp_api.status_code, 405, f"Expected 405 for GET on tools-api {tool}, got {resp_api.status_code}")
+            data = json.loads(resp_api.content)
+            self.assertEqual(data.get("error"), "POST required")
+

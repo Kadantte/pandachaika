@@ -1,13 +1,9 @@
-import typing
-from django.contrib.auth.decorators import permission_required
 from django.core.paginator import Paginator, Page, EmptyPage, InvalidPage
 from django.http import HttpRequest, HttpResponse, Http404
 from django.shortcuts import render
 
 
-from viewer.models import (
-    Gallery
-)
+from viewer.models import Gallery
 
 
 def change_log(request: HttpRequest, pk: int) -> HttpResponse:
@@ -18,19 +14,27 @@ def change_log(request: HttpRequest, pk: int) -> HttpResponse:
     if not gallery.public and not request.user.is_authenticated:
         raise Http404("Gallery does not exist")
 
-    gallery_history = gallery.history.order_by('-history_date')
+    gallery_history = gallery.history.order_by("-history_date")
 
     paginator = Paginator(gallery_history, 400)
     try:
-        page = int(request.GET.get("page", '1'))
+        page = int(request.GET.get("page", "1"))
     except ValueError:
         page = 1
 
     try:
-        results: typing.Optional[Page] = paginator.page(page)
+        results: Page | None = paginator.page(page)
     except (InvalidPage, EmptyPage):
         results = paginator.page(paginator.num_pages)
 
-    d = {'gallery': gallery, 'results': results}
+    if results is not None:
+        history_list = list(results.object_list)
+        for i in range(len(history_list) - 1):
+            history_list[i].cached_prev_record = history_list[i + 1]
+        if history_list:
+            history_list[-1].cached_prev_record = history_list[-1].prev_record
+        results.object_list = history_list
+
+    d = {"gallery": gallery, "results": results}
 
     return render(request, "viewer/gallery_change_log.html", d)

@@ -1,7 +1,10 @@
-document.querySelector("#toggle-all")
-    .addEventListener("click", () => {
+const toggleElements = document.querySelector("#toggle-all")
+
+if (toggleElements !== null) {
+    toggleElements.addEventListener("click", () => {
         document.querySelectorAll("input.toggle-list").forEach((element) => element.click());
-});
+    });
+}
 
 document.addEventListener("DOMContentLoaded", function(){
     const checkboxes = Array.from(document.querySelectorAll("input.toggle-list"));
@@ -15,14 +18,21 @@ document.addEventListener("DOMContentLoaded", function(){
             }
 
             if(e.shiftKey) {
-                const start = checkboxes.index(checkbox);
-                const end = checkboxes.index(lastChecked);
+                const start = checkboxes.indexOf(checkbox);
+                const end = checkboxes.indexOf(lastChecked);
 
-                checkboxes.slice(Math.min(start,end), Math.max(start,end)+ 1).prop('checked', lastChecked.checked);
+                checkboxes.slice(Math.min(start,end), Math.max(start,end)+ 1).forEach((slicedCheckbox) => {
+                    slicedCheckbox.checked = lastChecked.checked;
+                });
 
             }
 
             lastChecked = checkbox;
+        });
+        checkbox.addEventListener('mousedown', function(e) {
+            if(e.shiftKey) {
+                e.preventDefault();
+            }
         });
     })
 

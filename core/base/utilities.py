@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import heapq
 import html.entities
@@ -12,94 +11,49 @@ import typing
 import zipfile
 import zlib
 import fnmatch
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from difflib import SequenceMatcher
 from functools import wraps
+from collections.abc import Sequence, Iterator, Iterable
 from itertools import tee, islice, chain
 from tempfile import mkdtemp
-from typing import Union, Optional, Any, Tuple, List
+from typing import Any
 
 from ratelimit import limits, RateLimitException
 
+from core.base.cancellation import TaskCancelledError, interruptible_sleep
+from core.base.errors import ProviderBannedError
 from core.base.types import GalleryData, ArchiveGenericFile
 
-try:
-    import rarfile
-except ImportError:
-    rarfile = None
-
-try:
-    import py7zr
-except ImportError:
-    py7zr = None  # type: ignore
+import rarfile
+import py7zr
 
 import requests
 
-from core.base import setup
-
 if typing.TYPE_CHECKING:
-    from core.workers.schedulers import BaseScheduler
     from core.base.types import ProviderSettings
+    from core.base import setup
 
 logger = logging.getLogger(__name__)
 
-PUSHOVER_API_URL = 'https://api.pushover.net/1/messages.json'
+PUSHOVER_API_URL = "https://api.pushover.net/1/messages.json"
+WAYBACK_API_URL = "https://web.archive.org/cdx/search/cdx"
 
-ZIP_CONTAINER_REGEX = re.compile(r'(\.zip|\.cbz)$', re.IGNORECASE)
-IMAGES_REGEX = re.compile(r'(\.jpeg|\.jpg|\.png|\.gif)$', re.IGNORECASE)
+ZIP_CONTAINER_REGEX = re.compile(r"(\.zip|\.cbz)$", re.IGNORECASE)
+IMAGES_REGEX = re.compile(r"(\.jpeg|\.jpg|\.png|\.gif|\.webp)$", re.IGNORECASE)
 ZIP_CONTAINER_EXTENSIONS = [".zip", ".cbz"]
 
 REPLACE_CHARS = (
-    ('\\', '＼'),
-    ('/', '／'),
-    (':', '：'),
-    ('*', '＊'),
-    ('?', '？'),
-    ('"', '＂'),
-    ('<', '＜'),
-    ('>', '＞'),
-    ('|', '｜')
+    ("\\", "＼"),
+    ("/", "／"),
+    (":", "："),
+    ("*", "＊"),
+    ("?", "？"),
+    ('"', "＂"),
+    ("<", "＜"),
+    (">", "＞"),
+    ("|", "｜"),
 )
-
-
-# The idea of this class is to contain certain methods, to not have to pass arguments that are global.
-class GeneralUtils:
-
-    def __init__(self, global_settings: 'setup.Settings') -> None:
-        self.settings = global_settings
-
-    def discard_by_gallery_data(self, tag_list: Optional[list[str]], uploader: Optional[str] = None, force_check: bool = False) -> tuple[bool, list[str]]:
-
-        discarded = False
-        reasons: list[str] = []
-
-        if not force_check and self.settings.update_metadata_mode:
-            return discarded, reasons
-        if tag_list is not None:
-            found_tags = set(self.settings.banned_tags).intersection(tag_list)
-            if found_tags:
-                discarded = True
-                reasons.append("Banned tags: {}".format(", ".join(found_tags)))
-        if uploader is not None and uploader != '' and self.settings.banned_uploaders:
-            found_uploader = uploader in set(self.settings.banned_uploaders)
-            if found_uploader:
-                discarded = True
-                reasons.append("Banned uploader: {}".format(uploader))
-        return discarded, reasons
-
-    def get_torrent(self, torrent_url: str, cookies: dict[str, Any], convert_to_base64: bool = False) -> Union[str, bytes]:
-
-        r = requests.get(
-            torrent_url,
-            cookies=cookies,
-            headers=self.settings.requests_headers,
-            timeout=self.settings.timeout_timer
-        )
-
-        if not convert_to_base64:
-            return r.content
-        else:
-            return base64.encodebytes(r.content).decode('utf-8')
 
 
 def discard_string_by_cutoff(base: str, compare: str, cutoff: float) -> bool:
@@ -112,26 +66,30 @@ def discard_string_by_cutoff(base: str, compare: str, cutoff: float) -> bool:
     return False
 
 
-def replace_illegal_name(filepath: str) -> str:
+def replace_illegal_name(filepath: str, max_bytes: int = 240) -> str:
     delete_chars = r'\/:*?"<>|'
 
     for c in delete_chars:
-        filepath = filepath.replace(c, '')
+        filepath = filepath.replace(c, "")
 
     # Don't end with dot, might confuse some languages/OS.
     if filepath.endswith(".") and len(filepath) > 1:
         filepath = filepath[:-1]
 
-    # Limit to 255 characters, 251 plus .zip
-    # Update: Limit should be 256 bytes length (ext4).
+    # Limit to 240 bytes to ensure room for extensions (.zip: 4B), temporary suffixes (.part: 5B),
+    # and duplicate markers (-2: 2B). Ext4 filename limit is 255 bytes.
     try:
-        formatted_path = filepath.encode('utf-8')[0:251].decode('utf-8')
-    except UnicodeDecodeError:
-        formatted_path = filepath[0:251]
+        formatted_path = filepath.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    except Exception:
+        formatted_path = filepath[:max_bytes]
+
+    if formatted_path.endswith(".") and len(formatted_path) > 1:
+        formatted_path = formatted_path[:-1]
+
     return formatted_path
 
 
-def replace_illegal_win32_with_unicode_full_width(filepath: str) -> str:
+def replace_illegal_win32_with_unicode_full_width(filepath: str, max_bytes: int = 240) -> str:
     for c in REPLACE_CHARS:
         filepath = filepath.replace(c[0], c[1])
 
@@ -139,8 +97,16 @@ def replace_illegal_win32_with_unicode_full_width(filepath: str) -> str:
     if filepath.endswith(".") and len(filepath) > 1:
         filepath = filepath[:-1]
 
-    # Limit to 255 characters, 251 plus .zip
-    return filepath[0:251]
+    # Limit byte length
+    try:
+        formatted_path = filepath.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    except Exception:
+        formatted_path = filepath[:max_bytes]
+
+    if formatted_path.endswith(".") and len(formatted_path) > 1:
+        formatted_path = formatted_path[:-1]
+
+    return formatted_path
 
 
 def to_full_width(title: str) -> str:
@@ -149,18 +115,42 @@ def to_full_width(title: str) -> str:
     return title
 
 
-def calc_crc32(filename: str) -> str:
+CRC32_HEX_REGEX = re.compile(r"^[0-9A-Fa-f]{1,8}$")
+
+
+def normalize_crc32(value: str | None) -> str:
+    """CRC32 in the stored format: 8 uppercase hex digits (as ``calc_crc32`` returns it).
+
+    Older versions stored it with "%X", without leading zeros (33AC069 for 033AC069). Values that aren't a CRC32
+    (e.g. empty) are returned unchanged.
+    """
+    if value is None:
+        return ""
+    stripped = value.strip()
+    if CRC32_HEX_REGEX.match(stripped):
+        return stripped.upper().zfill(8)
+    return value
+
+
+def calc_crc32(filename: str, use_pool: bool = False) -> str:
+    if use_pool:
+        try:
+            from core.base.process_pool import calc_crc32_in_pool
+
+            return calc_crc32_in_pool(filename)
+        except Exception:
+            pass
     prev = 0
     with open(filename, "rb") as file_to_check:
-        for eachLine in file_to_check:
-            prev = zlib.crc32(eachLine, prev)
-    return "%X" % (prev & 0xFFFFFFFF)
+        while chunk := file_to_check.read(1048576):
+            prev = zlib.crc32(chunk, prev)
+    return "%08X" % (prev & 0xFFFFFFFF)
 
 
-def sha1_from_file_object(fp: Union[typing.IO, str], close_object: bool = False):
+def sha1_from_file_object(fp: typing.IO | str, close_object: bool = False):
 
     if isinstance(fp, str):
-        file_object: Union[typing.IO, typing.BinaryIO] = open(fp, "rb")
+        file_object: typing.IO | typing.BinaryIO = open(fp, "rb")
     else:
         file_object = fp
 
@@ -175,13 +165,10 @@ def sha1_from_file_object(fp: Union[typing.IO, str], close_object: bool = False)
     return hasher.hexdigest()
 
 
-T = typing.TypeVar('T')
-
-
-def chunks(sequence: typing.Sequence[T], n: int):
-    """ Yield successive n-sized chunks from l."""
+def chunks[T](sequence: Sequence[T], n: int):
+    """Yield successive n-sized chunks from l."""
     for i in range(0, len(sequence), n):
-        yield sequence[i:i + n]
+        yield sequence[i : i + n]
 
 
 def zfill_repl(match_obj: typing.Match):
@@ -191,70 +178,74 @@ def zfill_repl(match_obj: typing.Match):
 def zfill_to_four(namefile: str) -> str:
     filename = os.path.splitext(os.path.basename(namefile))[0]
 
-    filename = re.sub(r'\d+', zfill_repl, filename)
+    filename = re.sub(r"\d+", zfill_repl, filename)
 
     return filename.lower()
 
 
-def accept_images_only(name: str) -> Optional[str]:
-    r = re.compile(r'(\.jpeg|\.jpg|\.png|\.gif)$', re.IGNORECASE)
-    if r.search(name) and '__MACOSX' not in name:
+def accept_images_only(name: str) -> str | None:
+    if IMAGES_REGEX.search(name) and "__MACOSX" not in name:
         return name
     else:
         return None
 
 
-def discard_zipfile_extra_files(name: str) -> Optional[str]:
-    if '__MACOSX' not in name:
+def discard_zipfile_extra_files(name: str) -> str | None:
+    if "__MACOSX" not in name:
         return name
     else:
         return None
 
 
-def accept_images_only_info(fileinfo: zipfile.ZipInfo) -> Optional[zipfile.ZipInfo]:
-    r = re.compile(r'(\.jpeg|\.jpg|\.png|\.gif)$', re.IGNORECASE)
-    if r.search(fileinfo.filename) and '__MACOSX' not in fileinfo.filename:
+def accept_images_only_info(fileinfo: zipfile.ZipInfo) -> zipfile.ZipInfo | None:
+    if IMAGES_REGEX.search(fileinfo.filename) and "__MACOSX" not in fileinfo.filename:
         return fileinfo
     else:
         return None
 
 
-def discard_zipfile_extra_files_info(fileinfo: zipfile.ZipInfo) -> Optional[zipfile.ZipInfo]:
-    if '__MACOSX' not in fileinfo.filename:
+def discard_zipfile_extra_files_info(fileinfo: zipfile.ZipInfo) -> zipfile.ZipInfo | None:
+    if "__MACOSX" not in fileinfo.filename:
         return fileinfo
     else:
         return None
 
 
 # Allows 1 nested zip level, returns tuple: filename, containing zip(nested), extracted_name (adds nested zipfile)
-def get_images_from_zip(current_zip: zipfile.ZipFile) -> list[tuple[str, Optional[str], str]]:
+def get_images_from_zip(current_zip: zipfile.ZipFile) -> list[tuple[str, str | None, str]]:
     filtered_files = list(filter(discard_zipfile_extra_files, sorted(current_zip.namelist(), key=zfill_to_four)))
 
-    nested_files: list[tuple[str, Optional[str], str]] = []
+    nested_files: list[tuple[str, str | None, str]] = []
 
     for current_file in filtered_files:
         if IMAGES_REGEX.search(current_file):
             nested_files.append((current_file, None, current_file))
         elif ZIP_CONTAINER_REGEX.search(current_file):
-            with current_zip.open(current_file) as current_nested_zip_file:
-                try:
-                    nested_zip = zipfile.ZipFile(current_nested_zip_file, 'r')
-                except zipfile.BadZipFile:
-                    continue
-                nested_filtered_files = list(filter(accept_images_only, sorted(nested_zip.namelist(), key=zfill_to_four)))
-                found_files = [
-                    (x, current_file, "{}_{}".format(os.path.splitext(current_file)[0], x)) for x in nested_filtered_files
-                ]
-                nested_files.extend(found_files)
-                nested_zip.close()
+            try:
+                with current_zip.open(current_file) as current_nested_zip_file:
+                    try:
+                        nested_zip = zipfile.ZipFile(current_nested_zip_file, "r")
+                    except (zipfile.BadZipFile, NotImplementedError):
+                        continue
+                    nested_filtered_files = list(
+                        filter(accept_images_only, sorted(nested_zip.namelist(), key=zfill_to_four))
+                    )
+                    found_files = [
+                        (x, current_file, "{}_{}".format(os.path.splitext(current_file)[0], x))
+                        for x in nested_filtered_files
+                    ]
+                    nested_files.extend(found_files)
+                    nested_zip.close()
+            except (zipfile.BadZipFile, NotImplementedError):
+                continue
 
     return nested_files
 
 
 def filecount_in_zip(filepath: str) -> int:
     try:
-        my_zip = zipfile.ZipFile(filepath, 'r')
-    except zipfile.BadZipFile:
+        my_zip = zipfile.ZipFile(filepath, "r")
+    except (zipfile.BadZipFile, NotImplementedError):
         return 0
 
     total_count = 0
@@ -265,14 +256,17 @@ def filecount_in_zip(filepath: str) -> int:
         if IMAGES_REGEX.search(current_file):
             total_count += 1
         elif ZIP_CONTAINER_REGEX.search(current_file):
-            with my_zip.open(current_file) as current_nested_zip_file:
-                try:
-                    nested_zip = zipfile.ZipFile(current_nested_zip_file, 'r')
-                except zipfile.BadZipFile:
-                    continue
-                nested_files = list(filter(accept_images_only, nested_zip.namelist()))
-                total_count += len(nested_files)
-                nested_zip.close()
+            try:
+                with my_zip.open(current_file) as current_nested_zip_file:
+                    try:
+                        nested_zip = zipfile.ZipFile(current_nested_zip_file, "r")
+                    except (zipfile.BadZipFile, NotImplementedError):
+                        continue
+                    nested_files = list(filter(accept_images_only, nested_zip.namelist()))
+                    total_count += len(nested_files)
+                    nested_zip.close()
+            except (zipfile.BadZipFile, NotImplementedError):
+                continue
 
     my_zip.close()
 
@@ -281,8 +275,8 @@ def filecount_in_zip(filepath: str) -> int:
 
 def get_zip_filesize(filepath: str) -> int:
     try:
-        my_zip = zipfile.ZipFile(filepath, 'r')
-    except zipfile.BadZipFile:
+        my_zip = zipfile.ZipFile(filepath, "r")
+    except (zipfile.BadZipFile, NotImplementedError):
         return -1
 
     total_size = 0
@@ -293,42 +287,42 @@ def get_zip_filesize(filepath: str) -> int:
         if IMAGES_REGEX.search(current_file_info.filename):
             total_size += int(current_file_info.file_size)
         elif ZIP_CONTAINER_REGEX.search(current_file_info.filename):
-            with my_zip.open(current_file_info.filename) as current_nested_zip_file:
-                try:
-                    nested_zip = zipfile.ZipFile(current_nested_zip_file, 'r')
-                except zipfile.BadZipFile:
-                    continue
-                nested_files = list(filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename)))
-                total_size += sum([x.file_size for x in nested_files])
-                nested_zip.close()
+            try:
+                with my_zip.open(current_file_info.filename) as current_nested_zip_file:
+                    try:
+                        nested_zip = zipfile.ZipFile(current_nested_zip_file, "r")
+                    except (zipfile.BadZipFile, NotImplementedError):
+                        continue
+                    nested_files = list(
+                        filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename))
+                    )
+                    total_size += sum([x.file_size for x in nested_files])
+                    nested_zip.close()
+            except (zipfile.BadZipFile, NotImplementedError):
+                continue
 
     my_zip.close()
 
     return total_size
 
 
-def convert_rar_to_zip(filepath: str) -> int:
-    if not rarfile:
-        return -1
+def convert_rar_to_zip(filepath: str, temp_path: str | None = None) -> int:
     try:
         file_name = os.path.splitext(filepath)[0]
-        temp_rar_file = file_name + ".tar"
+        temp_rar_file = file_name + ".rar"
         os.rename(filepath, temp_rar_file)
-        my_rar = rarfile.RarFile(temp_rar_file, 'r')
+        my_rar = rarfile.RarFile(temp_rar_file, "r")
 
     except (rarfile.BadRarFile, rarfile.NotRarFile):
         return -1
 
-    new_zipfile = zipfile.ZipFile(filepath, 'w')
-    dirpath = mkdtemp()
+    new_zipfile = zipfile.ZipFile(filepath, "w")
+    dirpath = mkdtemp(dir=temp_path)
 
     filtered_files = list(filter(discard_zipfile_extra_files, sorted(my_rar.namelist())))
     for filename in filtered_files:
-        my_rar.extract(filename, path=dirpath)
-        new_zipfile.write(
-            os.path.join(dirpath, filename.replace('\\', '/')),
-            arcname=os.path.basename(filename)
-        )
+        extracted_filename = my_rar.extract(filename, path=dirpath)
+        new_zipfile.write(extracted_filename, arcname=os.path.basename(extracted_filename))
 
     my_rar.close()
     new_zipfile.close()
@@ -338,30 +332,25 @@ def convert_rar_to_zip(filepath: str) -> int:
     return 0
 
 
-def convert_7z_to_zip(filepath: str) -> int:
-    if not py7zr:
-        return -1
+def convert_7z_to_zip(filepath: str, temp_path: str | None = None) -> int:
     try:
         file_name = os.path.splitext(filepath)[0]
         temp_7z_file = file_name + ".t7z"
         os.rename(filepath, temp_7z_file)
-        my_7z = py7zr.SevenZipFile(temp_7z_file, 'r')
+        my_7z = py7zr.SevenZipFile(temp_7z_file, "r")
 
     except py7zr.Bad7zFile:
         return -1
 
-    new_zipfile = zipfile.ZipFile(filepath, 'w')
-    dirpath = mkdtemp()
+    new_zipfile = zipfile.ZipFile(filepath, "w")
+    dirpath = mkdtemp(dir=temp_path)
 
     filtered_files = list(filter(discard_zipfile_extra_files, sorted(my_7z.getnames())))
 
     my_7z.extract(targets=filtered_files, path=dirpath)
 
     for filename in filtered_files:
-        new_zipfile.write(
-            os.path.join(dirpath, filename.replace('\\', '/')),
-            arcname=os.path.basename(filename)
-        )
+        new_zipfile.write(os.path.join(dirpath, filename.replace("\\", "/")), arcname=os.path.basename(filename))
 
     my_7z.close()
     new_zipfile.close()
@@ -371,43 +360,45 @@ def convert_7z_to_zip(filepath: str) -> int:
     return 0
 
 
-def check_and_convert_to_zip(filepath: str) -> tuple[str, int]:
+def check_and_convert_to_zip(filepath: str, temp_path: str | None = None) -> tuple[str, int]:
     try:
-        zipfile.ZipFile(filepath, 'r')
-        return 'zip', 0
+        zipfile.ZipFile(filepath, "r")
+        return "zip", 0
     except zipfile.BadZipFile as e:
-        if str(e) != 'File is not a zip file':
-            return 'zip', 1
+        if str(e) != "File is not a zip file":
+            return "zip", 1
     try:
-        rarfile.RarFile(filepath, 'r')
-        convert_rar_to_zip(filepath)
-        return 'rar', 2
+        rarfile.RarFile(filepath, "r")
+        convert_rar_to_zip(filepath, temp_path)
+        return "rar", 2
     except rarfile.NotRarFile:
         pass
     try:
-        py7zr.SevenZipFile(filepath, 'r')
-        convert_7z_to_zip(filepath)
-        return '7z', 2
+        py7zr.SevenZipFile(filepath, "r")
+        convert_7z_to_zip(filepath, temp_path)
+        return "7z", 2
     except py7zr.exceptions.Bad7zFile as e:
-        if str(e) != 'not a 7z file':
-            return 'unknown', 1
-    return 'unknown', 1
+        if str(e) != "not a 7z file":
+            return "unknown", 1
+    return "unknown", 1
     # zipfile.BadZipFile: File is not a zip file
     # rarfile.NotRarFile: Not a RAR file
     # py7zr.exceptions.Bad7zFile: not a 7z file
 
 
-def get_zip_fileinfo(filepath: str, get_extra_data: bool = False) -> tuple[int, int, Optional[list[ArchiveGenericFile]]]:
+def get_zip_fileinfo(
+    filepath: str, get_extra_data: bool = False
+) -> tuple[int, int, list[ArchiveGenericFile] | None]:
     try:
-        my_zip = zipfile.ZipFile(filepath, 'r')
-    except zipfile.BadZipFile:
+        my_zip = zipfile.ZipFile(filepath, "r")
+    except (zipfile.BadZipFile, NotImplementedError):
         return -1, -1, None
 
     total_size = 0
     total_count = 0
 
     if get_extra_data:
-        other_file_data: Optional[list[ArchiveGenericFile]] = []
+        other_file_data: list[ArchiveGenericFile] | None = []
     else:
         other_file_data = None
 
@@ -418,20 +409,23 @@ def get_zip_fileinfo(filepath: str, get_extra_data: bool = False) -> tuple[int, 
             total_size += int(current_file_info.file_size)
             total_count += 1
         elif ZIP_CONTAINER_REGEX.search(current_file_info.filename):
-            with my_zip.open(current_file_info.filename) as current_nested_zip_file:
-                try:
-                    nested_zip = zipfile.ZipFile(current_nested_zip_file, 'r')
-                except zipfile.BadZipFile:
-                    continue
-                nested_files = list(filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename)))
-                total_count += len(nested_files)
-                total_size += sum([x.file_size for x in nested_files])
-                nested_zip.close()
+            try:
+                with my_zip.open(current_file_info.filename) as current_nested_zip_file:
+                    try:
+                        nested_zip = zipfile.ZipFile(current_nested_zip_file, "r")
+                    except (zipfile.BadZipFile, NotImplementedError):
+                        continue
+                    nested_files = list(
+                        filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename))
+                    )
+                    total_count += len(nested_files)
+                    total_size += sum([x.file_size for x in nested_files])
+                    nested_zip.close()
+            except (zipfile.BadZipFile, NotImplementedError):
+                continue
         elif other_file_data is not None and not current_file_info.is_dir():
             file_generic_data = ArchiveGenericFile(
-                file_name=current_file_info.filename,
-                file_size=int(current_file_info.file_size),
-                position=index
+                file_name=current_file_info.filename, file_size=int(current_file_info.file_size), position=index
             )
             other_file_data.append(file_generic_data)
 
@@ -442,8 +436,8 @@ def get_zip_fileinfo(filepath: str, get_extra_data: bool = False) -> tuple[int, 
 
 def get_zip_fileinfo_for_gallery(filepath: str) -> tuple[int, int]:
     try:
-        my_zip = zipfile.ZipFile(filepath, 'r')
-    except zipfile.BadZipFile:
+        my_zip = zipfile.ZipFile(filepath, "r")
+    except (zipfile.BadZipFile, NotImplementedError):
         return -1, -1
 
     total_size = 0
@@ -456,38 +450,161 @@ def get_zip_fileinfo_for_gallery(filepath: str) -> tuple[int, int]:
             total_size += int(current_file_info.file_size)
             total_count += 1
         elif ZIP_CONTAINER_REGEX.search(current_file_info.filename):
-            with my_zip.open(current_file_info.filename) as current_nested_zip_file:
-                try:
-                    nested_zip = zipfile.ZipFile(current_nested_zip_file, 'r')
-                except zipfile.BadZipFile:
-                    continue
-                nested_files = list(
-                    filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename)))
-                total_count += len(nested_files)
-                total_size += sum([x.file_size for x in nested_files])
-                nested_zip.close()
+            try:
+                with my_zip.open(current_file_info.filename) as current_nested_zip_file:
+                    try:
+                        nested_zip = zipfile.ZipFile(current_nested_zip_file, "r")
+                    except (zipfile.BadZipFile, NotImplementedError):
+                        continue
+                    nested_files = list(
+                        filter(accept_images_only_info, sorted(nested_zip.infolist(), key=lambda x: x.filename))
+                    )
+                    total_count += len(nested_files)
+                    total_size += sum([x.file_size for x in nested_files])
+                    nested_zip.close()
+            except (zipfile.BadZipFile, NotImplementedError):
+                continue
 
     my_zip.close()
 
     return total_size, total_count
 
 
-def available_filename(root: str, filename: str) -> str:
-    filename_full = os.path.join(root, filename)
+def available_filename(root: str, filename: str, max_bytes: int = 245) -> str:
+    file_head, file_tail = os.path.split(filename)
+    name, ext = os.path.splitext(file_tail)
 
-    extra_text = 2
-    if os.path.isfile(filename_full):
-        while (
-            os.path.isfile(
-                os.path.splitext(filename_full)[0] + "-" + str(extra_text)
-                + os.path.splitext(filename_full)[1])
-        ):
-            extra_text += 1
-        return (
-            os.path.splitext(filename)[0] + "-" + str(extra_text) + os.path.splitext(filename)[1]
-        )
+    max_suffix_bytes = 15
+
+    ext_bytes = ext.encode("utf-8")
+    if len(ext_bytes) > max_bytes - max_suffix_bytes:
+        ext = ext_bytes[: max_bytes - max_suffix_bytes].decode("utf-8", errors="ignore")
+        ext_bytes = ext.encode("utf-8")
+        name = ""
+
+    name_bytes = name.encode("utf-8")
+
+    extra_text = 1
+    while True:
+        suffix = "" if extra_text == 1 else f"-{extra_text}"
+        suffix_bytes = suffix.encode("utf-8")
+
+        avail_bytes = max_bytes - len(ext_bytes) - len(suffix_bytes)
+
+        if len(name_bytes) > avail_bytes:
+            truncated_name = name_bytes[:avail_bytes].decode("utf-8", errors="ignore")
+        else:
+            truncated_name = name
+
+        candidate_tail = truncated_name + suffix + ext
+        candidate_full = os.path.join(root, file_head, candidate_tail)
+
+        if not os.path.isfile(candidate_full) and not _is_filename_reserved_in_db(candidate_full):
+            return os.path.join(file_head, candidate_tail)
+
+        extra_text += 1
+
+
+def _is_filename_reserved_in_db(candidate_full: str) -> bool:
+    try:
+        from viewer.models import DownloadEvent
+        return DownloadEvent.objects.filter(
+            completed=False,
+            failed=False,
+            download_id=candidate_full,
+        ).exists()
+    except Exception:
+        return False
+
+
+def get_part_filepath(filepath: str, token: str | None = None) -> str:
+    """Return the temporary .part filepath for a given filepath, ensuring the filename does not exceed 255 bytes.
+
+    ``token`` makes the name unique per download attempt (``name.<token>.part``), so a stale thread from an aborted
+    attempt can never write to, or delete, the file of the attempt that replaced it.
+    """
+    file_head, file_tail = os.path.split(filepath)
+    ext = f".{token}.part" if token else ".part"
+    max_bytes = 255
+    part_bytes = ext.encode("utf-8")
+    tail_bytes = file_tail.encode("utf-8")
+
+    if len(tail_bytes) + len(part_bytes) > max_bytes:
+        allowed = max_bytes - len(part_bytes)
+        truncated_tail = tail_bytes[:allowed].decode("utf-8", errors="ignore")
+        return os.path.join(file_head, f"{truncated_tail}{ext}")
+
+    return f"{filepath}{ext}"
+
+
+def ensure_archive_filename_within_limits(archive: Any, root: str, max_bytes: int = 245) -> str:
+    """Ensure that archive.zipped.name fits within filesystem filename limits.
+
+    If the basename exceeds max_bytes, truncate it safely (preserving any [gid] suffix if present),
+    update archive.zipped in DB, and return the safe absolute path.
+    """
+    if not archive or not getattr(archive, "zipped", None):
+        return ""
+
+    current_name = archive.zipped.name if hasattr(archive.zipped, "name") else str(archive.zipped)
+    current_basename = os.path.basename(current_name)
+    current_bytes = len(current_basename.encode("utf-8"))
+
+    if current_bytes <= max_bytes:
+        dest_path = current_name if os.path.isabs(current_name) else os.path.join(root, current_name)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        return dest_path
+
+    m = re.search(r"^(.*?)(?:\s*\[(\d+)\])?(\.[^.]+)$", current_basename)
+    if m:
+        base_title, gid_match, ext = m.group(1), m.group(2), m.group(3)
+        gid_suffix = f" [{gid_match}]" if gid_match else ""
+        max_base = max(10, max_bytes - len(ext.encode("utf-8")) - len(gid_suffix.encode("utf-8")) - 5)
+        truncated_base = replace_illegal_name(base_title, max_bytes=max_base)
+        candidate_tail = f"{truncated_base}{gid_suffix}{ext}"
     else:
-        return filename
+        candidate_tail = current_basename
+
+    file_dir = os.path.dirname(current_name)
+    if os.path.isabs(file_dir) and file_dir.startswith(root):
+        file_dir = os.path.relpath(file_dir, root)
+    if file_dir == ".":
+        file_dir = ""
+
+    safe_rel_path = available_filename(root, os.path.join(file_dir, candidate_tail), max_bytes=max_bytes)
+    archive.zipped = safe_rel_path
+    if hasattr(archive, "save"):
+        try:
+            archive.save(update_fields=["zipped"])
+        except Exception as e:
+            logger.warning("Failed to update archive %s zipped path in DB: %s", getattr(archive, "pk", None), e)
+
+    dest_path = os.path.join(root, safe_rel_path)
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    return dest_path
+
+
+def find_hath_directory(dir_names: Iterable[str], gid: str | int) -> str | None:
+    """Find the download folder for a given gallery gid.
+
+    First priority: folder ending with [gid] (e.g. 'Title [3802429]').
+    Alternative fallback: entire folder name is the gallery gid (e.g. '3802429').
+    """
+    gid_str = str(gid).strip()
+    dir_list = list(dir_names)
+
+    # 1. First priority: folder ending with [gid]
+    for name in dir_list:
+        m = re.search(r".*?\[(\d+)]$", name)
+        if m and m.group(1) == gid_str:
+            return name
+
+    # 2. Alternative: entire folder name is gid
+    for name in dir_list:
+        if name.strip() == gid_str:
+            return name
+
+    return None
 
 
 def get_base_filename_string_from_gallery_data(gallery_data: GalleryData) -> str:
@@ -498,7 +615,7 @@ def get_base_filename_string_from_gallery_data(gallery_data: GalleryData) -> str
     elif gallery_data.link:
         return gallery_data.link
     else:
-        return ''
+        return ""
 
 
 def translate_tag(tag: str) -> str:
@@ -527,15 +644,15 @@ def translate_tag_list(tags: list[str]) -> list[str]:
 
 def clean_title(title: str) -> str:
     # Remove parenthesis
-    adjusted_title = re.sub(r'\s+\(.+?\)$', r'', re.sub(r'\[.+?\]\s*', r'', title)).replace("_", "")
+    adjusted_title = re.sub(r"\s+\(.+?\)$", r"", re.sub(r"\[.+?\]\s*", r"", title)).replace("_", "")
     # Remove non words, non whitespace
     # adjusted_title = re.sub(r'[^\w\s]', r' ', adjusted_title)
     return adjusted_title
 
 
 def format_title_to_wanted_search(title: str) -> str:
-    words_and_ws = re.sub(r'\W', ' ', title)
-    words_and_ws_once = re.sub(r'\s+', ' ', words_and_ws)
+    words_and_ws = re.sub(r"\W", " ", title)
+    words_and_ws_once = re.sub(r"\s+", " ", words_and_ws)
     return words_and_ws_once
 
 
@@ -547,26 +664,26 @@ def file_matches_any_filter(title: str, filters: list[str]) -> bool:
 
 
 def artist_from_title(title: str) -> str:
-    m = re.match(r'\[(.+?)\]\s*', title)
+    m = re.match(r"\[(.+?)\]\s*", title)
     if m:
         artist = m.group(1)
     else:
-        artist = ''
+        artist = ""
     return artist
 
 
-def str_to_int(number: Optional[str]) -> Union[str, int]:
+def str_to_int(number: str | None) -> str | int:
     return number or 0
 
 
-def timestamp_or_zero(posted: Optional[datetime]) -> float:
+def timestamp_or_zero(posted: datetime | None) -> float:
     if posted:
         return posted.timestamp()
     else:
         return 0.0
 
 
-def timestamp_or_null(posted: Optional[datetime]) -> Optional[int]:
+def timestamp_or_null(posted: datetime | None) -> int | None:
     if posted:
         return int(posted.timestamp())
     else:
@@ -576,7 +693,7 @@ def timestamp_or_null(posted: Optional[datetime]) -> Optional[int]:
 def compare_search_title_with_strings(original_title: str, titles: list[str]) -> bool:
     if not original_title:
         return False
-    pattern = '.*?{}.*?'.format(re.sub(r'\\\s+', '.+', re.escape(original_title.lower())))
+    pattern = ".*?{}.*?".format(re.sub(r"\\\s+", ".+", re.escape(original_title.lower())))
     re_object = re.compile(pattern)
     for title in titles:
         # # This search is too simple:
@@ -610,17 +727,37 @@ def get_scored_matches(word: str, possibilities: list[str], n: int = 3, cutoff: 
 
 
 def get_title_from_path(path: str) -> str:
-    return re.sub('[_]', ' ', os.path.splitext(os.path.basename(path))[0])
+    return re.sub("[_]", " ", os.path.splitext(os.path.basename(path))[0])
 
 
 needed_keys = [
-    'gid', 'token', 'title', 'title_jpn',
-    'category', 'uploader', 'posted', 'filecount',
-    'filesize', 'expunged', 'rating', 'fjord',
-    'hidden', 'dl_type', 'comment', 'thumbnail_url',
-    'public', 'provider', 'gallery_container_gid', 'magazine_gid',
-    'status', 'origin', 'reason',
-    'parent_gallery_gid', 'first_gallery_gid', 'provider_metadata'
+    "gid",
+    "token",
+    "title",
+    "title_jpn",
+    "category",
+    "uploader",
+    "posted",
+    "filecount",
+    "filesize",
+    "expunged",
+    "disowned",
+    "rating",
+    "fjord",
+    "hidden",
+    "dl_type",
+    "comment",
+    "thumbnail_url",
+    "public",
+    "provider",
+    "gallery_container_gid",
+    "magazine_gid",
+    "status",
+    "origin",
+    "reason",
+    "parent_gallery_gid",
+    "first_gallery_gid",
+    "provider_metadata",
 ]
 
 
@@ -635,17 +772,20 @@ def get_dict_allowed_fields(gallery_data: GalleryData) -> dict[str, Any]:
     return gallery_dict
 
 
-def previous_and_next(some_iterable: typing.Sequence[Optional[T]]) -> typing.Iterator[tuple[Optional[T], Optional[T], Optional[T]]]:
+def previous_and_next[T](
+    some_iterable: Sequence[T | None],
+) -> Iterator[tuple[T | None, T | None, T | None]]:
     prevs, items, nexts = tee(some_iterable, 3)
     prevs = chain([None], prevs)
     nexts = chain(islice(nexts, 1, None), [None])
     return zip(prevs, items, nexts)
 
 
-def unescape(text: Optional[str]) -> Optional[str]:
+def unescape(text: str | None) -> str | None:
     if text is None:
         return None
     else:
+
         def fixup(m: typing.Match):
             in_text = m.group(0)
             if in_text[:2] == "&#":
@@ -664,67 +804,89 @@ def unescape(text: Optional[str]) -> Optional[str]:
                 except KeyError:
                     pass
             return in_text  # leave as is
+
         return re.sub(r"&#?\w+;", fixup, text)
 
 
-def get_thread_status() -> list[tuple[tuple[str, str, str], bool]]:
-    info_list = []
-    thread_names = set()
 
-    thread_list = threading.enumerate()
-    for thread_info in setup.GlobalInfo.worker_threads:
-        info_list.append((thread_info, any([thread_info[0] == thread.name for thread in thread_list])))
-        thread_names.add(thread_info[0])
-
-    for thread_data in thread_list:
-        if thread_data.name not in thread_names:
-            info_list.append(((thread_data.name, 'None', 'other'), thread_data.is_alive()))
-
-    return info_list
+class SchedulerStatusInfo(typing.NamedTuple):
+    name: str
+    is_running: bool
+    last_run: datetime | None
+    cycle_timer: str
+    next_run: datetime | None
+    worker_pid: int | None = None
 
 
-def get_schedulers_status(schedulers: typing.Sequence[Optional['BaseScheduler']]) -> list[tuple[str, bool, Optional[datetime], str, Optional[datetime]]]:
+def get_schedulers_status(
+    schedulers: typing.Sequence[Any],
+) -> list[SchedulerStatusInfo]:
     info_list = []
 
     for scheduler in schedulers:
         if scheduler:
-            if scheduler.last_run:
-                next_run: Optional[datetime] = scheduler.last_run + timedelta(seconds=scheduler.timer)
+            name: str = str(getattr(scheduler, "thread_name", None) or getattr(scheduler, "name", "") or "")
+
+            if callable(getattr(scheduler, "is_running", None)):
+                is_running = scheduler.is_running()
+            elif hasattr(scheduler, "is_active"):
+                is_running = scheduler.is_active
+            else:
+                is_running = bool(getattr(scheduler, "is_running", False))
+                if hasattr(scheduler, "last_heartbeat") and scheduler.last_heartbeat:
+                    try:
+                        import django.utils.timezone as django_tz
+                        cutoff = django_tz.now() - timedelta(seconds=30)
+                        is_running = bool(is_running and scheduler.last_heartbeat >= cutoff)
+                    except Exception:
+                        pass
+            last_run = getattr(scheduler, "current_last_run", getattr(scheduler, "last_run", None))
+
+            if hasattr(scheduler, "cycle_timer"):
+                timer = scheduler.cycle_timer
+            elif hasattr(scheduler, "timer"):
+                timer = scheduler.timer
+            else:
+                timer = 0.0
+
+            if getattr(scheduler, "next_run", None):
+                next_run = scheduler.next_run
+            elif last_run and timer:
+                next_run = last_run + timedelta(seconds=timer)
+            elif is_running:
+                import django.utils.timezone as django_tz
+                next_run = django_tz.now()
             else:
                 next_run = None
 
+            timer_sec_str = str(int(timer)) if timer == int(timer) else str(timer)
+            cycle_timer_str = f"{timer_sec_str}, {timer / 60}"
+            worker_pid = getattr(scheduler, "worker_pid", None)
+
             info_list.append(
-                (
-                    scheduler.thread_name,
-                    scheduler.is_running(),
-                    scheduler.last_run,
-                    str(scheduler.timer) + ", " + str(scheduler.timer / 60),
-                    next_run
+                SchedulerStatusInfo(
+                    name=name,
+                    is_running=is_running,
+                    last_run=last_run,
+                    cycle_timer=cycle_timer_str,
+                    next_run=next_run,
+                    worker_pid=worker_pid,
                 )
             )
 
     return info_list
 
 
-def get_thread_status_bool() -> dict[str, bool]:
-    info_dict = {}
-
-    thread_list = threading.enumerate()
-    for thread_info in setup.GlobalInfo.worker_threads:
-        if any([thread_info[0] == thread.name for thread in thread_list]):
-            info_dict[thread_info[0]] = True
-        else:
-            info_dict[thread_info[0]] = False
-
-    return info_dict
-
-
-def check_for_running_threads() -> bool:
-    thread_list = threading.enumerate()
-    for thread_name in setup.GlobalInfo.worker_threads:
-        if any([thread_name[0] == thread.name for thread in thread_list]):
-            return True
-    return False
+def get_schedulers_status_from_db(
+    schedulers: typing.Sequence[Any] | None = None,
+) -> list[SchedulerStatusInfo]:
+    if schedulers is None:
+        try:
+            from django.conf import settings
+            schedulers = settings.CRAWLER_SETTINGS.workers.get_active_initialized_workers_from_db()
+        except Exception:
+            schedulers = []
+    return get_schedulers_status(schedulers)
 
 
 def thread_exists(thread_name: str) -> bool:
@@ -734,6 +896,42 @@ def thread_exists(thread_name: str) -> bool:
             return True
 
     return False
+
+
+def thread_exists_in_db(thread_name: str) -> bool:
+    try:
+        from workers.models import TaskQueue
+        alias_groups = [
+            {"fileinfo_worker", "recalc_all_file_info", "calculate_missing_info"},
+            {"thumbnails_worker", "regenerate_all_thumbs", "generate_missing_thumbs"},
+            {"extract_worker", "extract_archives"},
+            {"publish_worker", "publish_archives", "set_all_hidden_as_public"},
+            {"foldercrawler", "folder_crawler"},
+            {"webcrawler", "web_crawler"},
+            {"match_unmatched_worker", "generate_possible_matches_internally"},
+            {"web_search_worker", "search_wanted_galleries_provider_titles"},
+            {"wanted_local_search_worker", "wanted_galleries_possible_matches"},
+            {"match_unmatched_gallery_groups_worker"},
+            {"web_match_worker"},
+        ]
+        query_types = [thread_name]
+        for group in alias_groups:
+            if thread_name in group:
+                query_types = list(group)
+                break
+
+        if TaskQueue.objects.filter(
+            status__in=[TaskQueue.Status.PENDING, TaskQueue.Status.PROCESSING],
+            task_type__in=query_types,
+        ).exists():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+task_exists = thread_exists_in_db
 
 
 def module_exists(module_name: str) -> bool:
@@ -746,29 +944,30 @@ def module_exists(module_name: str) -> bool:
 
 
 class StandardFormatter(logging.Formatter):
-    def formatException(self, exc_info: Any) -> str:
-        result = super(StandardFormatter, self).formatException(exc_info)
+    def formatException(self, ei: 'logging._SysExcInfoType') -> str:
+        result = super(StandardFormatter, self).formatException(ei)
         return result
 
     def format(self, record: logging.LogRecord) -> str:
         s = super(StandardFormatter, self).format(record)
-        s += '[0m'
+        s += "[0m"
         return s
 
 
-def send_pushover_notification(user_key: str, token: str, message: str, title: str = "Alert", sound: str = '', device: str = '', attachment: str = '') -> bool:
+def send_pushover_notification(
+    user_key: str,
+    token: str,
+    message: str,
+    title: str = "Alert",
+    sound: str = "",
+    device: str = "",
+    attachment: str = "",
+) -> bool:
 
-    payload = {
-        'token': token,
-        'user': user_key,
-        'message': message,
-        'title': title,
-        'sound': sound,
-        'device': device
-    }
+    payload = {"token": token, "user": user_key, "message": message, "title": title, "sound": sound, "device": device}
 
     if attachment:
-        files = {'attachment': open(attachment, 'rb')}
+        files = {"attachment": open(attachment, "rb")}
         r = requests.post(PUSHOVER_API_URL, data=payload, files=files)
     else:
         r = requests.post(PUSHOVER_API_URL, data=payload)
@@ -780,27 +979,126 @@ def send_pushover_notification(user_key: str, token: str, message: str, title: s
 
 
 def request_with_retries(
-        url: str, request_dict: dict[str, Any],
-        post: bool = False, retries: int = 3) -> Optional[requests.models.Response]:
+    url: str, request_dict: dict[str, Any], post: bool = False, retries: int = 3
+) -> requests.models.Response | None:
     for retry_count in range(retries):
         try:
             if post:
                 r = requests.post(url, **request_dict)
             else:
                 r = requests.get(url, **request_dict)
+
+            if r.status_code in (500, 502, 503, 504):
+                if retry_count < retries - 1:
+                    logger.warning(
+                        "Request returned HTTP {}, attempt {} of {}: retrying {}".format(
+                            r.status_code, retry_count + 1, retries, url
+                        )
+                    )
+                    time.sleep(2 ** retry_count)
+                    continue
+
             return r
 
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
             if retry_count < retries - 1:
                 logger.warning("Request failed, attempt: {} of {}: {}".format(retry_count + 1, retries, str(e)))
+                time.sleep(2 ** retry_count)
                 continue
             else:
-                logger.error("Request failed, attempt: {} of {}: Unreachable URL: {}".format(retry_count + 1, retries, url))
+                logger.error(
+                    "Request failed, attempt: {} of {}: Unreachable URL: {}".format(retry_count + 1, retries, url)
+                )
                 return None
     return None
 
 
-REQUESTER_BY_PROVIDER: dict[str, typing.Callable[[str, dict[str, Any], bool, int], Optional[requests.models.Response]]] = {}
+REQUESTER_BY_PROVIDER: dict[
+    str, typing.Callable[..., requests.models.Response | None]
+] = {}
+# Longest ban or cooldown a running task waits out. Longer ones raise ProviderBannedError, so the task is put back
+# in the queue instead of occupying a worker (and its task type) for hours.
+MAX_INLINE_BAN_WAIT = 900.0
+
+PROVIDER_RATE_LIMIT_CONFIG: dict[str, tuple[int, float]] = {}
+PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+
+
+def parse_panda_ban_duration(text: str) -> float | None:
+    """Parse temporary rate-limit ban duration in seconds from Panda/E-Hentai response text.
+
+    Example messages:
+    - 'This IP address has been temporarily banned due to an excessive request rate. ... The ban expires in 4 minutes and 51 seconds'
+    - 'Your IP address has been temporarily banned for excessive pageloads. ... The ban expires in 1 days'
+    """
+    if not text or not isinstance(text, str):
+        return None
+    lowered = text.lower()
+    if "temporarily banned" not in lowered and "the ban expires in" not in lowered:
+        return None
+    match = re.search(r"The ban expires in\s+([^.\n]+)", text, re.IGNORECASE)
+    if not match:
+        return None
+    raw_time_str = re.sub(r"<[^>]+>", " ", match.group(1))
+
+    days = re.search(r"(\d+)\s*days?", raw_time_str, re.IGNORECASE)
+    hours = re.search(r"(\d+)\s*hours?", raw_time_str, re.IGNORECASE)
+    minutes = re.search(r"(\d+)\s*minutes?", raw_time_str, re.IGNORECASE)
+    seconds = re.search(r"(\d+)\s*seconds?", raw_time_str, re.IGNORECASE)
+
+    total_seconds = 0.0
+    found = False
+    if days:
+        total_seconds += int(days.group(1)) * 86400
+        found = True
+    if hours:
+        total_seconds += int(hours.group(1)) * 3600
+        found = True
+    if minutes:
+        total_seconds += int(minutes.group(1)) * 60
+        found = True
+    if seconds:
+        total_seconds += int(seconds.group(1))
+        found = True
+
+    return total_seconds if found else None
+
+
+def set_provider_cooldown(
+    provider_name: str,
+    cooldown_seconds: float,
+    url: str = "",
+) -> float:
+    """Set dynamic cooldown/ban timestamp for provider across database and in-memory rate limiters."""
+    now = time.time()
+    cooldown_until = now + max(0.0, float(cooldown_seconds))
+
+    targets = [provider_name]
+    if "panda" in provider_name:
+        targets = list(set([provider_name, "panda", "panda_web"]))
+
+    for target in targets:
+        PROVIDER_COOLDOWN_UNTIL[target] = max(PROVIDER_COOLDOWN_UNTIL.get(target, 0.0), cooldown_until)
+
+    try:
+        from django.db import transaction
+        from workers.models import ProviderRateLimit
+
+        with transaction.atomic():
+            for target in targets:
+                ProviderRateLimit.objects.get_or_create(name=target)
+                rl_obj = ProviderRateLimit.objects.select_for_update().get(name=target)
+                if hasattr(rl_obj, "cooldown_until"):
+                    rl_obj.cooldown_until = max(getattr(rl_obj, "cooldown_until", 0.0) or 0.0, cooldown_until)
+                    rl_obj.save(update_fields=["cooldown_until", "updated_at"])
+    except Exception as e:
+        logger.debug("Could not persist provider cooldown to database: {}".format(e))
+
+    return cooldown_until
 
 
 # Modified ratelimit function
@@ -811,47 +1109,186 @@ def sleep_log_and_retry(func):
             try:
                 return func(*args, **kwargs)
             except RateLimitException as exception:
-                logger.warning("Request limited, sleeping for {} seconds".format(exception.period_remaining))
+                url = args[0] if args else ""
+                logger.info("Request limited for URL: {}, sleeping for {} seconds".format(url, exception.period_remaining))
                 time.sleep(exception.period_remaining)
 
     return wrapper
 
 
+def acquire_provider_rate_limit_slot(
+    provider_name: str,
+    provider_calls: int,
+    provider_limit: float,
+    url: str = "",
+) -> bool:
+    """Acquire a rate-limit slot for provider_name using PostgreSQL ProviderRateLimit with select_for_update.
+    Returns True if handled by the database rate limiter, or False if DB is unavailable.
+    """
+    period = float(provider_limit)
+    if period <= 0:
+        return True
+
+    clamped_calls = max(1, int(provider_calls))
+
+    try:
+        from django.db import transaction
+        from workers.models import ProviderRateLimit
+
+        while True:
+            wait_time = 0.0
+            with transaction.atomic():
+                ProviderRateLimit.objects.get_or_create(
+                    name=provider_name,
+                    defaults={
+                        "calls": clamped_calls,
+                        "period": period,
+                        "call_timestamps": [],
+                    },
+                )
+                rl_obj = ProviderRateLimit.objects.select_for_update().get(name=provider_name)
+                now = time.time()
+                cooldown_until = getattr(rl_obj, "cooldown_until", 0.0) or 0.0
+                mem_cooldown = PROVIDER_COOLDOWN_UNTIL.get(provider_name, 0.0)
+                effective_cooldown = max(cooldown_until, mem_cooldown)
+
+                if effective_cooldown > now:
+                    wait_time = max(0.01, effective_cooldown - now)
+                    if wait_time > MAX_INLINE_BAN_WAIT:
+                        raise ProviderBannedError(provider_name, wait_time, url)
+                else:
+                    raw_ts = rl_obj.call_timestamps if isinstance(rl_obj.call_timestamps, list) else []
+                    valid_ts = [float(ts) for ts in raw_ts if 0.0 <= (now - float(ts)) < period]
+                    if len(valid_ts) < clamped_calls:
+                        valid_ts.append(now)
+                        rl_obj.call_timestamps = valid_ts
+                        rl_obj.calls = clamped_calls
+                        rl_obj.period = period
+                        update_fields = ["call_timestamps", "calls", "period", "updated_at"]
+                        if hasattr(rl_obj, "cooldown_until") and rl_obj.cooldown_until != 0.0:
+                            rl_obj.cooldown_until = 0.0
+                            update_fields.append("cooldown_until")
+                        rl_obj.save(update_fields=update_fields)
+                        return True
+                    else:
+                        oldest = min(valid_ts)
+                        wait_time = min(period, max(0.01, period - (now - oldest)))
+                        if len(valid_ts) != len(raw_ts):
+                            rl_obj.call_timestamps = valid_ts
+                            rl_obj.save(update_fields=["call_timestamps", "updated_at"])
+
+            logger.info("Request limited for URL: {}, sleeping for {} seconds".format(url, wait_time))
+            interruptible_sleep(wait_time)
+    except (ProviderBannedError, TaskCancelledError):
+        raise
+    except Exception:
+        return False
+
+
+# Ban pages are small. Don't decode big bodies (images, archives) as text just to look for one.
+BAN_PAGE_MAX_BYTES = 256 * 1024
+
+
+def _may_contain_ban_page(response: Any) -> bool:
+    """Whether a (non streaming) response is worth searching for a provider ban message."""
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        content_type = headers.get("Content-Type")
+        if isinstance(content_type, str) and content_type:
+            lowered = content_type.lower()
+            if not any(kind in lowered for kind in ("text/", "json", "html", "xml")):
+                return False
+        content_length = headers.get("Content-Length")
+        if isinstance(content_length, str) and content_length.isdigit() and int(content_length) > BAN_PAGE_MAX_BYTES:
+            return False
+    return isinstance(getattr(response, "text", None), str)
+
+
 def request_by_provider(provider_name: str, provider_calls: int, provider_limit: float):
+    PROVIDER_RATE_LIMIT_CONFIG[provider_name] = (int(provider_calls), float(provider_limit))
     if provider_name not in REQUESTER_BY_PROVIDER:
 
         def call_requests():
             @sleep_log_and_retry
-            @limits(calls=provider_calls, period=provider_limit, name=provider_name)
-            def inner_function(*args, **kwargs):
+            @limits(calls=max(1, int(provider_calls)), period=max(0.001, float(provider_limit)), name=provider_name)
+            def fallback_in_memory(*args, **kwargs):
                 return request_with_retries(*args, **kwargs)
+
+            def inner_function(*args, **kwargs):
+                calls, limit = PROVIDER_RATE_LIMIT_CONFIG.get(
+                    provider_name, (int(provider_calls), float(provider_limit))
+                )
+                url = str(args[0]) if args else str(kwargs.get("url", ""))
+
+                max_ban_retries = 1
+                for attempt in range(max_ban_retries + 1):
+                    # Check in-memory cooldown before proceeding (especially if fallback is used)
+                    now = time.time()
+                    mem_cooldown = PROVIDER_COOLDOWN_UNTIL.get(provider_name, 0.0)
+                    if mem_cooldown > now:
+                        wait_time = max(0.01, mem_cooldown - now)
+                        if wait_time > MAX_INLINE_BAN_WAIT:
+                            raise ProviderBannedError(provider_name, wait_time, url)
+                        logger.info("Request limited for URL: {}, sleeping for {} seconds".format(url, wait_time))
+                        interruptible_sleep(wait_time)
+
+                    if acquire_provider_rate_limit_slot(provider_name, calls, limit, url=url):
+                        response = request_with_retries(*args, **kwargs)
+                    else:
+                        response = fallback_in_memory(*args, **kwargs)
+
+                    req_dict = args[1] if len(args) > 1 and isinstance(args[1], dict) else kwargs
+                    is_stream = bool(
+                        req_dict.get("stream")
+                        or (isinstance(kwargs.get("request_dict"), dict) and kwargs["request_dict"].get("stream"))
+                    )
+
+                    if not is_stream and response is not None and _may_contain_ban_page(response):
+                        ban_duration = parse_panda_ban_duration(response.text)
+                        if ban_duration is not None:
+                            cooldown_wait = ban_duration + 5.0
+                            logger.warning(
+                                "Temporary IP rate limit ban detected from {} (URL: {}). "
+                                "The ban expires in {:.1f}s. Adjusting dynamic rate limit/cooldown to {} seconds.".format(
+                                    provider_name, url, ban_duration, cooldown_wait
+                                )
+                            )
+                            set_provider_cooldown(provider_name, cooldown_wait, url=url)
+                            if attempt < max_ban_retries and ban_duration <= MAX_INLINE_BAN_WAIT:
+                                logger.info(
+                                    "Sleeping for {} seconds before retrying request for URL: {}".format(
+                                        cooldown_wait, url
+                                    )
+                                )
+                                interruptible_sleep(cooldown_wait)
+                                continue
+                            # Don't hand the ban page to the caller as if it was the content it asked for.
+                            raise ProviderBannedError(provider_name, cooldown_wait, url)
+
+                    return response
+
             return inner_function
+
         REQUESTER_BY_PROVIDER[provider_name] = call_requests()
 
     return REQUESTER_BY_PROVIDER[provider_name]
 
 
-def construct_request_dict(settings: 'setup.Settings', own_settings: 'ProviderSettings', no_cookies: bool = False) -> dict[str, Any]:
-    request_dict = {
-        'headers': settings.requests_headers,
-        'timeout': own_settings.timeout_timer,
-    }
+def provider_web_request(provider_name: str, wait_timer: float):
+    """Requester for a provider's website, rate limited in the shared "<provider>_web" bucket.
 
-    if not no_cookies:
-        request_dict['cookies'] = own_settings.cookies
-
-    if own_settings.proxies:
-        request_dict['proxies'] = own_settings.proxies
-    return request_dict
+    Parsers, matchers, wanted generators and downloaders of the same provider use this bucket, so their
+    requests to the same site are paced together."""
+    return request_by_provider("{}_web".format(provider_name), 1, float(wait_timer))
 
 
-def get_filename_from_cd(cd: typing.Optional[str] = None):
+def get_filename_from_cd(cd: str | None = None):
     """
     Get filename from content-disposition
     """
     if not cd:
         return None
-    fname = re.findall('filename=(.+)', cd)
+    fname = re.findall("filename=(.+)", cd)
     if len(fname) == 0:
         return None
     return fname[0]
@@ -865,3 +1302,45 @@ def remove_archive_extensions(filename: str):
     for extension in ZIP_CONTAINER_EXTENSIONS:
         filename = filename.replace(extension, "")
     return filename
+
+
+def get_oldest_entry_from_wayback(url: str) -> datetime | None:
+    request_url = WAYBACK_API_URL + "?url={}&output=json&fl=timestamp&limit=1&filter=statuscode:200".format(url)
+    r = request_with_retries(request_url, {})
+    if r is None:
+        return None
+    if r.status_code == 200:
+        json_response = r.json()
+        if len(json_response) >= 2:
+            if len(json_response[1]) >= 1:
+                return datetime.strptime(json_response[1][0], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    return None
+
+
+def hamming_distance(phash1, phash2):
+    return sum(c1 != c2 for c1, c2 in zip(phash1, phash2))
+
+
+def construct_request_dict(
+    settings: "setup.Settings", own_settings: "ProviderSettings", no_cookies: bool = False
+) -> dict[str, Any]:
+    request_dict = {
+        "headers": settings.requests_headers,
+        "timeout": own_settings.timeout_timer,
+    }
+
+    if not no_cookies:
+        request_dict["cookies"] = own_settings.cookies
+
+    proxies = getattr(own_settings, "proxies", None) or getattr(settings, "proxies", None)
+    if not proxies:
+        proxy = getattr(own_settings, "proxy", "") or getattr(settings, "proxy", "")
+        if proxy:
+            proxies = {"http": proxy, "https": proxy}
+    if proxies:
+        request_dict["proxies"] = proxies
+
+    if own_settings.headers:
+        request_dict["headers"] = settings.requests_headers | own_settings.headers
+
+    return request_dict

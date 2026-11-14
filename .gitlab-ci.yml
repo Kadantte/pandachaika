@@ -1,31 +1,94 @@
 stages:
+  - static-check
   - test
   - deploy
+  - build
 
 variables:
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  UV_CACHE_DIR: "$CI_PROJECT_DIR/.cache/uv"
+  PYTHON_VERSION: "3.13"
+  FF_TIMESTAMPS: true
 
-cache:
+# Skip the whole pipeline when the only change is TODO.md.
+# `changes` doesn't support negated globs, so we list everything that should
+# trigger a pipeline: every file inside a subdirectory, plus root-level files
+# by extension/name. If you add a new root-level file with an unlisted
+# extension, add it to the list below.
+workflow:
+  rules:
+    # Manually started, scheduled, API-triggered and downstream pipelines always run.
+    - if: $CI_PIPELINE_SOURCE =~ /^(web|schedule|api|trigger|pipeline|parent_pipeline)$/
+    - changes:
+        paths:
+          - "*/**/*"
+          - ".*"
+          - "*.{py,toml,yml,yaml,lock,txt,sh,json,ini,cfg,env,xml}"
+          - "{Dockerfile,LICENSE,README.md}"
+    - when: never
+
+cache: &global_cache
+  key:
+    files:
+      - uv.lock
+    prefix: "uv-$PYTHON_VERSION"
+  fallback_keys:
+    - "uv-$PYTHON_VERSION"
+    - "uv"
   paths:
-  - .mypy_cache
-  - .ruff_cache
-  - .cache/pip
+    - .cache/uv
+    - .mypy_cache
+    - .ruff_cache
 
-test3.9:
-  stage: test
+static-analysis:
+  stage: static-check
+  image: astral/uv:python$PYTHON_VERSION-trixie
+  cache:
+    <<: *global_cache
   script:
-  - python3.9 --version
-  - pip3.9 -V
-  - python3.9 -m venv ENV3.9
-  - source ENV3.9/bin/activate
-  - pip3.9 install -r ci-requirements.txt
-  - ruff --exclude="ENV3.9" .
-  - mypy core pandabackup viewer --exclude viewer/migrations
-  - bash ./set_db_engine.sh
-  - python3.9 manage.py migrate
-  - python3.9 manage.py test viewer.tests.test_internal viewer.tests.test_core
+    - python --version
+    - uv sync --locked --active --group ci
+    - uv run --no-sync ruff check --exclude=".venv" .
+    - uv run --no-sync mypy --show-traceback core pandabackup viewer workers
+    - uv cache prune --ci
   tags:
     - django
+    - panda
+
+test-all:
+  stage: test
+  parallel:
+    matrix:
+      - PYTHON_VERSION:
+        - '3.14'
+        - '3.15'
+  cache:
+    <<: *global_cache
+  image: astral/uv:python$PYTHON_VERSION-trixie
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_DB: pandaweb
+    POSTGRES_USER: pandaadmin
+    POSTGRES_PASSWORD: pandaadmin
+    DATABASE_ENGINE: postgresql
+    DATABASE_NAME: pandaweb
+    DATABASE_USERNAME: pandaadmin
+    DATABASE_PASSWORD: pandaadmin
+    DATABASE_HOST: postgres
+    DATABASE_PORT: "5432"
+    DEBUG: "true"
+    MEDIA_ROOT: /tmp/media/
+    STATIC_ROOT: /tmp/static/
+  script:
+    - python --version
+    - uv sync --locked --active --group ci --group dev
+    - uv run --no-sync manage.py migrate
+    - uv run --no-sync pytest --durations=20 --junitxml=test-results/TEST-pytest.xml
+    - uv cache prune --ci
+  tags:
+    - django
+    - panda
   artifacts:
     when: always
     paths:
@@ -33,83 +96,23 @@ test3.9:
     reports:
       junit: test-results/TEST-*.xml
 
-test3.10:
-  stage: test
-  script:
-  - python3.10 --version
-  - pip3.10 -V
-  - python3.10 -m venv ENV3.10
-  - source ENV3.10/bin/activate
-  - pip3.10 install -r ci-requirements.txt
-  - ruff --exclude="ENV3.10" .
-  - mypy core pandabackup viewer --exclude viewer/migrations
-  - bash ./set_db_engine.sh
-  - python3.10 manage.py migrate
-  - python3.10 manage.py test viewer.tests.test_internal viewer.tests.test_core
-  tags:
-    - django
-  artifacts:
-    when: always
-    paths:
-      - test-results/TEST-*.xml
-    reports:
-      junit: test-results/TEST-*.xml
-
-test3.11:
-  stage: test
-  script:
-  - python3.11 --version
-  - pip3.11 -V
-  - python3.11 -m venv ENV3.11
-  - source ENV3.11/bin/activate
-  - pip3.11 install -r ci-requirements.txt
-  - ruff --exclude="ENV3.11" .
-  - mypy core pandabackup viewer --exclude viewer/migrations
-  - bash ./set_db_engine.sh
-  - python3.11 manage.py migrate
-  - python3.11 manage.py test viewer.tests.test_internal viewer.tests.test_core
-  tags:
-    - django
-  artifacts:
-    when: always
-    paths:
-      - test-results/TEST-*.xml
-    reports:
-      junit: test-results/TEST-*.xml
-
-deploy_review:
-  stage: deploy
-  before_script:
-    - mkdir -p ~/.ssh
-    - eval $(ssh-agent -s)
-    - 'echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
-    - ssh-add <(echo "$SERVER_PRIV_KEY_REVIEW")
-  script:
-    - rsync -av --delete --exclude='.gitlab-ci.yml' --exclude='.git/' --exclude='static/' --exclude settings.ini --exclude settings.yaml . ${SERVER_REMOTE_ADDR_REVIEW}:${SERVER_REMOTE_DIR_REVIEW}
-    - ssh $SERVER_REMOTE_ADDR_REVIEW "cd $SERVER_REMOTE_DIR_REVIEW && python3.9 -m venv ENV && source ENV/bin/activate && pip install -r requirements.txt && python manage.py migrate && python manage.py collectstatic --noinput && {{test -f ./current.pid && cat ./current.pid | xargs kill -9} || true } && python server.py -d -pf ./current.pid"
-  environment:
-    name: review/$CI_COMMIT_REF_NAME
-    url: $SERVER_URL_REVIEW
-  only:
-    - trunk
-  tags:
-    - django
-
-deploy_prod:
-  stage: deploy
-  before_script:
-    - mkdir -p ~/.ssh
-    - eval $(ssh-agent -s)
-    - 'echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
-    - ssh-add <(echo "$SERVER_PRIV_KEY_PROD")
-  script:
-    - rsync -av --delete --exclude='.gitlab-ci.yml' --exclude='.git/' --exclude='static/' --exclude settings.ini --exclude settings.yaml . ${SERVER_REMOTE_ADDR_PROD}:${SERVER_REMOTE_DIR_PROD}
-    - ssh $SERVER_REMOTE_ADDR_PROD "cd $SERVER_REMOTE_DIR_PROD && python3.9 -m venv ENV && source ENV/bin/activate && pip install -r requirements.txt && python manage.py migrate && python manage.py collectstatic --noinput && {{test -f ./current.pid && cat ./current.pid | xargs kill -9} || true } && python server.py -d -pf ./current.pid"
-  environment:
-    name: review/$CI_COMMIT_REF_NAME
-    url: $SERVER_URL_PROD
+build-image:
+  stage: build
   when: manual
-  only:
-    - trunk
-  tags:
-    - django
+  dependencies: []
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    # Kaniko/Go looks in /kaniko/ssl/certs/ca-certificates.crt:
+    - cat "$INTERNAL_CA_CERT" >> /kaniko/ssl/certs/ca-certificates.crt
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+      --destination "${CI_REGISTRY_IMAGE}:latest"
+#  rules:
+#    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

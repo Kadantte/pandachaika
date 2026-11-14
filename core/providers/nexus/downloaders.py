@@ -1,16 +1,19 @@
 import logging
 import os
-from typing import Optional
 
 import requests
 
 from core.base.types import DataDict
-from core.base.utilities import calc_crc32, get_base_filename_string_from_gallery_data, \
-    get_zip_fileinfo_for_gallery, construct_request_dict
+from core.base.utilities import (
+    calc_crc32,
+    get_base_filename_string_from_gallery_data,
+    get_zip_fileinfo_for_gallery,
+    construct_request_dict,
+    request_by_provider,
+)
 from core.downloaders.handlers import BaseDownloader, BaseInfoDownloader, BaseGalleryDLDownloader
 from viewer.models import Archive
-from core.base.utilities import (available_filename,
-                                 replace_illegal_name)
+from core.base.utilities import available_filename, replace_illegal_name
 from . import constants
 
 logger = logging.getLogger(__name__)
@@ -18,8 +21,14 @@ logger = logging.getLogger(__name__)
 
 class ArchiveDownloader(BaseDownloader):
 
-    type = 'archive'
+    type = "archive"
     provider = constants.provider_name
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.web_request_function = request_by_provider(
+            self.provider + "_web", 1, self.own_settings.wait_timer
+        )
 
     def start_download(self) -> None:
 
@@ -31,55 +40,79 @@ class ArchiveDownloader(BaseDownloader):
         to_use_filename = replace_illegal_name(to_use_filename)
 
         self.gallery.filename = available_filename(
-            self.settings.MEDIA_ROOT,
-            os.path.join(
-                self.own_settings.archive_dl_folder,
-                to_use_filename + '.zip'))
-
-        request_dict = construct_request_dict(self.settings, self.own_settings)
-
-        request_file = requests.get(
-            self.gallery.archiver_key,
-            stream=True,
-            **request_dict
+            self.settings.MEDIA_ROOT, os.path.join(self.own_settings.archive_dl_folder, to_use_filename + ".zip")
         )
 
-        filepath = os.path.join(self.settings.MEDIA_ROOT,
-                                self.gallery.filename)
-        with open(filepath, 'wb') as fo:
-            for chunk in request_file.iter_content(4096):
-                fo.write(chunk)
+        filepath = os.path.join(self.settings.MEDIA_ROOT, self.gallery.filename)
+        request_dict = construct_request_dict(self.settings, self.own_settings)
 
-        self.gallery.filesize, self.gallery.filecount = get_zip_fileinfo_for_gallery(filepath)
-        if self.gallery.filesize > 0:
-            self.crc32 = calc_crc32(filepath)
+        if self.should_queue_archive_download():
+            self.enqueue_archive_download(
+                self.gallery.archiver_key,
+                filepath,
+                request_dict=request_dict,
+                rate_limit_provider=self.provider,
+                rate_limit_period=self.own_settings.wait_timer,
+            )
+            return
 
-            self.fileDownloaded = 1
-            self.return_code = 1
+        request_dict["stream"] = True
 
-        else:
+        for attempt in range(3):
+            try:
+                request_file = self.web_request_function(self.gallery.archiver_key, request_dict)
+                if not request_file:
+                    logger.error("Could not download archive (Attempt {}/3)".format(attempt + 1))
+                    continue
+
+                total_size = int(request_file.headers.get("Content-Length", 0))
+                self.download_event = self.create_download_event(self.gallery.link, self.type, filepath, total_size=total_size)
+                with open(filepath, "wb") as fo:
+                    for chunk in request_file.iter_content(4096):
+                        fo.write(chunk)
+
+                self.gallery.filesize, self.gallery.filecount = get_zip_fileinfo_for_gallery(filepath)
+                if self.gallery.filesize > 0:
+                    self.crc32 = calc_crc32(filepath)
+
+                    self.fileDownloaded = 1
+                    self.return_code = 1
+                    break
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError
+            ) as e:
+                logger.warning("Download failed on attempt {}/3 with error: {}".format(attempt + 1, str(e)))
+                if self.download_event:
+                    self.download_event.set_as_failed()
+                    self.download_event.save()
+                    self.download_event = None
+
+        if self.return_code != 1:
             logger.error("Could not download archive")
-            os.remove(filepath)
+            filepath = os.path.join(self.settings.MEDIA_ROOT, self.gallery.filename)
+            if os.path.exists(filepath):
+                 os.remove(filepath)
             self.return_code = 0
 
-    def update_archive_db(self, default_values: DataDict) -> Optional['Archive']:
+    def update_archive_db(self, default_values: DataDict) -> "Archive | None":
 
         if not self.gallery:
             return None
 
         values = {
-            'title': self.gallery.title,
-            'title_jpn': '',
-            'zipped': self.gallery.filename,
-            'crc32': self.crc32,
-            'filesize': self.gallery.filesize,
-            'filecount': self.gallery.filecount,
+            "title": self.gallery.title,
+            "title_jpn": "",
+            "zipped": self.gallery.filename,
+            "crc32": self.crc32,
+            "filesize": self.gallery.filesize,
+            "filecount": self.gallery.filecount,
         }
         default_values.update(values)
         return Archive.objects.update_or_create_by_values_and_gid(
-            default_values,
-            (self.gallery.gid, self.gallery.provider),
-            zipped=self.gallery.filename
+            default_values, (self.gallery.gid, self.gallery.provider), zipped=self.gallery.filename
         )
 
 

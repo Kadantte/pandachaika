@@ -1,7 +1,9 @@
-provider_name = 'mugimugi'
-home_page = 'https://www.doujinshi.org'
+from typing import Final
 
-main_page = 'https://www.doujinshi.org'
-gallery_container_urls = ['doujinshi.org/book/', 'mugimugi.org/book/']
+provider_name: Final[str] = "mugimugi"
+home_page = "https://www.doujinshi.org"
+
+main_page = "https://www.doujinshi.org"
+gallery_container_urls = ["doujinshi.org/book/", "mugimugi.org/book/"]
 
 daily_requests = 1000

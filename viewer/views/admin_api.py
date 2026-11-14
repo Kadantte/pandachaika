@@ -2,27 +2,19 @@ import os.path
 import json
 import logging
 import signal
-import threading
-
+from typing import Any
 import yaml
 from django.http import HttpResponse, HttpRequest
 from django.conf import settings
 from django.utils.dateparse import parse_date
 
-from core.base.utilities import (
-    get_thread_status_bool,
-    thread_exists)
-from core.web.crawlerthread import CrawlerThread
-from core.workers.imagework import ImageWorker
+from core.base.setup_utilities import get_thread_status_bool
+from core.base.utilities import thread_exists_in_db
+from core.workers.archive_work import ArchiveWorker
 
-from viewer.models import (
-    Archive,
-    ArchiveMatches,
-    WantedGallery)
-from viewer.utils.matching import (
-    create_matches_wanted_galleries_from_providers,
-    create_matches_wanted_galleries_from_providers_internal,
-    generate_possible_matches_for_archives)
+from viewer.models import Archive, ArchiveMatches, WantedGallery
+from viewer.utils.webserver import WebServerRestartError, restart_web_server
+from workers import client
 
 
 MAIN_LOGGER = settings.MAIN_LOGGER
@@ -30,337 +22,492 @@ crawler_settings = settings.CRAWLER_SETTINGS
 logger = logging.getLogger(__name__)
 
 
+def _find_yaml_node_mark(root_node: Any, loc: tuple[str | int, ...]) -> tuple[int, int]:
+    """Locate the starting line and column (0-indexed) of a field path in a PyYAML AST node."""
+    if not root_node:
+        return (0, 0)
+    curr = root_node
+    target_node = root_node
+    for part in loc:
+        if isinstance(curr, yaml.MappingNode):
+            found = False
+            for k_node, v_node in curr.value:
+                if k_node.value == str(part):
+                    target_node = k_node
+                    curr = v_node
+                    found = True
+                    break
+            if not found:
+                break
+        elif isinstance(curr, yaml.SequenceNode):
+            try:
+                idx = int(part)
+                if 0 <= idx < len(curr.value):
+                    curr = curr.value[idx]
+                    target_node = curr
+                else:
+                    break
+            except (ValueError, IndexError):
+                break
+        else:
+            break
+    if target_node and hasattr(target_node, "start_mark"):
+        return (target_node.start_mark.line, target_node.start_mark.column)
+    return (0, 0)
+
+
+def validate_yaml_settings(settings_text: str) -> dict[str, Any]:
+    """Validate settings YAML text against PandaGalleryConfig.
+
+    Returns a dictionary formatted for Ace.js annotations and detailed error reporting:
+    {
+        'valid': bool,
+        'annotations': [{'row': int, 'column': int, 'text': str, 'type': 'error'}],
+        'errors': [{'loc': str, 'msg': str, 'row': int, 'col': int}],
+        'message': str,
+    }
+    """
+    from pydantic import ValidationError
+    from core.base.config_models import PandaGalleryConfig
+
+    if not settings_text.strip():
+        return {
+            "valid": True,
+            "annotations": [],
+            "errors": [],
+            "message": "Configuration is empty (defaults will be used)",
+        }
+
+    # 1. Parse YAML syntax
+    try:
+        parsed_data = yaml.safe_load(settings_text)
+        node_tree = yaml.compose(settings_text)
+    except yaml.MarkedYAMLError as exc:
+        line = exc.problem_mark.line if exc.problem_mark else 0
+        col = exc.problem_mark.column if exc.problem_mark else 0
+        msg = f"YAML Syntax Error: {exc.problem or exc}"
+        return {
+            "valid": False,
+            "annotations": [{"row": line, "column": col, "text": msg, "type": "error"}],
+            "errors": [{"loc": "syntax", "msg": msg, "row": line, "col": col}],
+            "message": msg,
+        }
+    except yaml.YAMLError as exc:
+        msg = f"YAML Error: {exc}"
+        return {
+            "valid": False,
+            "annotations": [{"row": 0, "column": 0, "text": msg, "type": "error"}],
+            "errors": [{"loc": "syntax", "msg": msg, "row": 0, "col": 0}],
+            "message": msg,
+        }
+
+    if parsed_data is None:
+        return {
+            "valid": True,
+            "annotations": [],
+            "errors": [],
+            "message": "Configuration is empty (defaults will be used)",
+        }
+
+    if not isinstance(parsed_data, dict):
+        msg = "Configuration root must be a YAML mapping/dictionary"
+        return {
+            "valid": False,
+            "annotations": [{"row": 0, "column": 0, "text": msg, "type": "error"}],
+            "errors": [{"loc": "root", "msg": msg, "row": 0, "col": 0}],
+            "message": msg,
+        }
+
+    # 2. Validate against Pydantic schema
+    try:
+        PandaGalleryConfig.model_validate(parsed_data)
+    except ValidationError as val_err:
+        annotations = []
+        errors = []
+        for err in val_err.errors():
+            loc_tuple = err["loc"]
+            line, col = _find_yaml_node_mark(node_tree, loc_tuple)
+            loc_str = " -> ".join(str(p) for p in loc_tuple)
+            err_msg = f"{loc_str}: {err['msg']}"
+            annotations.append({
+                "row": line,
+                "column": col,
+                "text": err_msg,
+                "type": "error",
+            })
+            errors.append({
+                "loc": loc_str,
+                "msg": err["msg"],
+                "row": line,
+                "col": col,
+            })
+        return {
+            "valid": False,
+            "annotations": annotations,
+            "errors": errors,
+            "message": f"Validation failed with {len(errors)} error(s)",
+        }
+
+    return {
+        "valid": True,
+        "annotations": [],
+        "errors": [],
+        "message": "Configuration schema is valid",
+    }
+
+
+# Tools that read or write the raw settings file. The settings file contains every credential
+# (database, providers, torrent clients) and command templates that get executed on the host
+# (e.g. cloning_image_tool.executable_path), so access is equivalent to OS-level access: superusers only.
+SUPERUSER_ONLY_TOOLS = frozenset({"settings", "validate_settings", "reload_settings"})
+READ_ONLY_TOOLS = frozenset({"config_schema", "settings_schema", "default_config", "threads_status"})
+
+
 # Admin related APIs
-def tools(request: HttpRequest, tool: str = "main", tool_arg: str = '') -> HttpResponse:
+def tools(request: HttpRequest, tool: str = "main", tool_arg: str = "") -> HttpResponse:
     """Tools listing."""
-    response = {}
+    response: dict[str, Any] = {}
     if not request.user.is_staff:
-        response['error'] = 'Not allowed'
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
-    if tool == "transfer_missing_downloads":
-        crawler_thread = CrawlerThread(crawler_settings, '-tmd'.split())
-        crawler_thread.start()
+        response["error"] = "Not allowed"
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
+    if tool in SUPERUSER_ONLY_TOOLS and not request.user.is_superuser:
+        response["error"] = "Superuser required"
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=403)
+    if tool not in READ_ONLY_TOOLS and tool not in ("settings", "main"):
+        if request.method != "POST":
+            response["error"] = "POST required"
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=405)
+    if tool == "reconcile_downloads":
+        from viewer.utils.downloads import reconcile_downloads
+
+        stats = reconcile_downloads(settings=crawler_settings)
+        response["stats"] = stats
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "retry_failed":
-        crawler_thread = CrawlerThread(crawler_settings, '--retry-failed'.split())
-        crawler_thread.start()
+        client.enqueue(args=["--retry-failed"], task_type="web_crawler", override_options=crawler_settings, user=request.user)
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "update_newer_than":
-        p = request.GET
-        if p and 'newer_than' in p and crawler_settings.workers.web_queue:
-            newer_than_date = p['newer_than']
+        p = request.POST if request.POST else request.GET
+        if p and "newer_than" in p:
+            newer_than_date = p["newer_than"]
             try:
                 if parse_date(newer_than_date) is not None:
-                    crawler_settings.workers.web_queue.enqueue_args_list(('-unt', newer_than_date))
+                    client.enqueue(args=["-unt", newer_than_date], task_type="web_crawler", override_options=crawler_settings, user=request.user)
                     return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
                 else:
-                    response['error'] = 'Invalid date format.'
+                    response["error"] = "Invalid date format."
             except ValueError:
-                response['error'] = 'Invalid date.'
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
+                response["error"] = "Invalid date."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
     elif tool == "update_missing_thumbnails":
-        p = request.GET
-        if p and 'limit_number' in p and crawler_settings.workers.web_queue:
+        p = request.POST if request.POST else request.GET
+        if p and "limit_number" in p:
 
             try:
-                limit_number = int(p['limit_number'])
+                limit_number = int(p["limit_number"])
 
-                provider = request.GET.get('provider', '')
+                provider = p.get("provider", "")
                 if provider:
-                    crawler_settings.workers.web_queue.enqueue_args_list(
-                        ('-umt', str(limit_number), '-ip', provider)
-                    )
+                    client.enqueue(args=["-umt", str(limit_number), "-ip", provider], task_type="web_crawler", override_options=crawler_settings, user=request.user)
                 else:
-                    crawler_settings.workers.web_queue.enqueue_args_list(
-                        ('-umt', str(limit_number))
-                    )
+                    client.enqueue(args=["-umt", str(limit_number)], task_type="web_crawler", override_options=crawler_settings, user=request.user)
                 return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
 
             except ValueError:
-                response['error'] = 'Invalid limit.'
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
+                response["error"] = "Invalid limit."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
     elif tool == "generate_missing_thumbs":
-        archives = Archive.objects.filter(thumbnail='')
-        for archive in archives:
-            logger.info(
-                'Generating thumbs for file: {}'.format(archive.zipped.name))
-            archive.generate_thumbnails()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "calculate_missing_info":
-        archives_missing_file_info = Archive.objects.filter_by_missing_file_info()
-        for archive in archives_missing_file_info:
-            logger.info(
-                'Calculating file info for file: {}'.format(archive.zipped.name))
-            archive.recalc_fileinfo()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "recalc_all_file_info":
-        if thread_exists('fileinfo_worker'):
-            response['error'] = 'File info worker is already running.'
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
-
-        archives = Archive.objects.all()
-        logger.info(
-            'Recalculating file info for all archives, count: {}'.format(archives.count())
-        )
-
-        image_worker_thread = ImageWorker(4)
-        for archive in archives:
-            if os.path.exists(archive.zipped.path):
-                image_worker_thread.enqueue_archive(archive)
-        fileinfo_thread = threading.Thread(
-            name='fileinfo_worker', target=image_worker_thread.start_info_thread)
-        fileinfo_thread.start()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "set_all_hidden_as_public":
-
-        archives = Archive.objects.filter(gallery__hidden=True)
-
-        for archive in archives:
-            if os.path.isfile(archive.zipped.path):
-                archive.public = True
-                archive.save()
-                if archive.gallery:
-                    archive.gallery.public = True
-                    archive.gallery.save()
-
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "regenerate_all_thumbs":
-        if thread_exists('thumbnails_worker'):
-            response['error'] = "Thumbnails worker is already running."
+        if thread_exists_in_db("thumbnails_worker"):
+            response["error"] = "Thumbnails worker is already running."
             return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
 
-        archives = Archive.objects.all()
-        logger.info(
-            'Generating thumbs for all archives, count {}'.format(archives.count()))
+        archives_no_thumbnail = Archive.objects.filter(thumbnail="")
+        archive_pks = list(archives_no_thumbnail.values_list("pk", flat=True))
+        if not archive_pks:
+            response["message"] = "No archives missing thumbnails found."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
 
-        image_worker_thread = ImageWorker(4)
-        for archive in archives:
-            if os.path.exists(archive.zipped.path):
-                image_worker_thread.enqueue_archive(archive)
-        thumbnails_thread = threading.Thread(
-            name='thumbnails_worker',
-            target=image_worker_thread.start_thumbs_thread
-        )
-        thumbnails_thread.start()
+        logger.info("Generating thumbs for %d archives missing thumbnails", len(archive_pks))
+        if crawler_settings.workers.archive_worker:
+            crawler_settings.workers.archive_worker.regenerate_all_thumbs(archives=archive_pks, user=request.user)
+        else:
+            archive_worker_thread = ArchiveWorker(crawler_settings, 4)
+            archive_worker_thread.regenerate_all_thumbs(archives=archive_pks, user=request.user)
+        response["message"] = f"Thumbnails worker started in background for {len(archive_pks)} archives."
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "calculate_missing_info":
+        if thread_exists_in_db("fileinfo_worker"):
+            response["error"] = "File info worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        archives_missing_file_info = Archive.objects.filter_by_missing_file_info()
+        archive_pks = list(archives_missing_file_info.values_list("pk", flat=True))
+        if not archive_pks:
+            response["message"] = "No archives missing file info found."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        logger.info("Calculating file info for %d archives missing info", len(archive_pks))
+        if crawler_settings.workers.archive_worker:
+            crawler_settings.workers.archive_worker.recalc_all_file_info(archives=archive_pks, user=request.user)
+        else:
+            archive_worker_thread = ArchiveWorker(crawler_settings, 4)
+            archive_worker_thread.recalc_all_file_info(archives=archive_pks, user=request.user)
+        response["message"] = f"File info worker started in background for {len(archive_pks)} archives."
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "recalc_all_file_info":
+        if thread_exists_in_db("fileinfo_worker"):
+            response["error"] = "File info worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        logger.info("Recalculating file info for all archives")
+        if crawler_settings.workers.archive_worker:
+            crawler_settings.workers.archive_worker.recalc_all_file_info(user=request.user)
+        else:
+            archive_worker_thread = ArchiveWorker(crawler_settings, 4)
+            archive_worker_thread.recalc_all_file_info(user=request.user)
+        response["message"] = "File info worker started in background."
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "set_all_hidden_as_public":
+        if thread_exists_in_db("publish_worker"):
+            response["error"] = "Publish worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        archives = Archive.objects.filter(gallery__hidden=True)
+        archive_pks = list(archives.values_list("pk", flat=True))
+        if not archive_pks:
+            response["message"] = "No archives of hidden galleries found."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        logger.info("Publishing %d archives with hidden galleries", len(archive_pks))
+        if crawler_settings.workers.archive_worker:
+            crawler_settings.workers.archive_worker.publish_archives(archives=archive_pks, user=request.user)
+        else:
+            archive_worker_thread = ArchiveWorker(crawler_settings, 4)
+            archive_worker_thread.publish_archives(archives=archive_pks, user=request.user)
+        response["message"] = f"Publish worker started in background for {len(archive_pks)} archives."
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "regenerate_all_thumbs":
+        if thread_exists_in_db("thumbnails_worker"):
+            response["error"] = "Thumbnails worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+
+        logger.info("Generating thumbs for all archives")
+        if crawler_settings.workers.archive_worker:
+            crawler_settings.workers.archive_worker.regenerate_all_thumbs(user=request.user)
+        else:
+            archive_worker_thread = ArchiveWorker(crawler_settings, 4)
+            archive_worker_thread.regenerate_all_thumbs(user=request.user)
+        response["message"] = "Thumbnails worker started in background."
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "generate_possible_matches_internally":
-        if thread_exists('match_unmatched_worker'):
-            response['error'] = "Matching worker is already running."
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
-        provider = request.GET.get('provider', '')
+        if thread_exists_in_db("match_unmatched_worker"):
+            response["error"] = "Matching worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
+        p = request.POST if request.POST else request.GET
+        provider = p.get("provider", "")
         try:
-            cutoff = float(request.GET.get('cutoff', '0.4'))
+            cutoff = float(p.get("cutoff", "0.4"))
         except ValueError:
             cutoff = 0.4
         try:
-            max_matches = int(request.GET.get('max-matches', '10'))
+            max_matches = int(p.get("max-matches", p.get("max_matches", "10")))
         except ValueError:
             max_matches = 10
         logger.info(
-            'Looking for possible matches in gallery database '
-            'for non-matched archives (cutoff: {}, max matches: {}) '
+            "Looking for possible matches in gallery database "
+            "for non-matched archives (cutoff: {}, max matches: {}) "
             'using provider filter "{}"'.format(cutoff, max_matches, provider)
         )
-        matching_thread = threading.Thread(
-            name='match_unmatched_worker',
-            target=generate_possible_matches_for_archives,
-            args=(None,),
-            kwargs={
-                'cutoff': cutoff, 'max_matches': max_matches, 'filters': (provider,),
-                'match_local': True, 'match_web': False
-            })
-        matching_thread.daemon = True
-        matching_thread.start()
-        response['message'] = 'Looking for possible matches, filtering providers: {}, cutoff: {}.'.format(
+        client.enqueue_matching_task(
+            task_type="match_unmatched_worker",
+            args=None,
+            matching_kwargs={
+                "cutoff": cutoff,
+                "max_matches": max_matches,
+                "filters": (provider,),
+                "match_local": True,
+                "match_web": False,
+                "auto_link": bool(p.get("auto_link")),
+            },
+            user=request.user,
+        )
+        response["message"] = "Looking for possible matches, filtering providers: {}, cutoff: {}.".format(
             provider, cutoff
         )
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "clear_all_archive_possible_matches":
         ArchiveMatches.objects.all().delete()
-        logger.info('Clearing all possible matches for archives.')
-        response['message'] = 'Clearing all possible matches for archives.'
+        logger.info("Clearing all possible matches for archives.")
+        response["message"] = "Clearing all possible matches for archives."
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "search_wanted_galleries_provider_titles":
-        if thread_exists('web_search_worker'):
-            response['error'] = 'Web search worker is already running.'
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
+        if thread_exists_in_db("web_search_worker"):
+            response["error"] = "Web search worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
         results = WantedGallery.objects.eligible_to_search()
 
         if not results:
-            logger.info('No wanted galleries eligible to search.')
-            response['message'] = 'No wanted galleries eligible to search.'
+            logger.info("No wanted galleries eligible to search.")
+            response["message"] = "No wanted galleries eligible to search."
             return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
 
-        provider = request.GET.get('provider', '')
+        p = request.POST if request.POST else request.GET
+        provider = p.get("provider", "")
 
-        logger.info(
-            'Searching for gallery matches in panda for wanted galleries, starting thread.')
-        response['message'] = 'Searching for gallery matches in panda for wanted galleries, starting thread.'
-        panda_search_thread = threading.Thread(
-            name='web_search_worker',
-            target=create_matches_wanted_galleries_from_providers,
-            args=(results, provider),
+        logger.info("Searching for gallery matches in panda for wanted galleries, starting thread.")
+        response["message"] = "Searching for gallery matches in panda for wanted galleries, starting thread."
+        client.enqueue_matching_task(
+            task_type="web_search_worker",
+            args=results,
+            provider=provider,
+            user=request.user,
         )
-        panda_search_thread.daemon = True
-        panda_search_thread.start()
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "wanted_galleries_possible_matches":
-        if thread_exists('wanted_local_search_worker'):
-            response['error'] = "Wanted local matching worker is already running."
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
+        if thread_exists_in_db("wanted_local_search_worker"):
+            response["error"] = "Wanted local matching worker is already running."
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
 
         non_match_wanted = WantedGallery.objects.eligible_to_search()
 
         if not non_match_wanted:
-            logger.info('No wanted galleries eligible to search.')
-            response['message'] = 'No wanted galleries eligible to search.'
+            logger.info("No wanted galleries eligible to search.")
+            response["message"] = "No wanted galleries eligible to search."
             return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
 
-        logger.info(
-            'Looking for possible matches in gallery database '
-            'for wanted galleries (fixed 0.4 cutoff)'
-        )
+        logger.info("Looking for possible matches in gallery database " "for wanted galleries (fixed 0.4 cutoff)")
 
-        provider = request.GET.get('provider', '')
+        p = request.POST if request.POST else request.GET
+        provider = p.get("provider", "")
 
         try:
-            cutoff = float(request.GET.get('cutoff', '0.4'))
+            cutoff = float(p.get("cutoff", "0.4"))
         except ValueError:
             cutoff = 0.4
         try:
-            max_matches = int(request.GET.get('max-matches', '10'))
+            max_matches = int(p.get("max-matches", p.get("max_matches", "10")))
         except ValueError:
             max_matches = 10
 
-        matching_thread = threading.Thread(
-            name='wanted_local_search_worker',
-            target=create_matches_wanted_galleries_from_providers_internal,
-            args=(non_match_wanted, ),
-            kwargs={'provider_filter': provider, 'cutoff': cutoff, 'max_matches': max_matches})
-        matching_thread.daemon = True
-        matching_thread.start()
+        client.enqueue_matching_task(
+            task_type="wanted_local_search_worker",
+            args=non_match_wanted,
+            matching_kwargs={"provider_filter": provider, "cutoff": cutoff, "max_matches": max_matches},
+            user=request.user,
+        )
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "restart_viewer":
-        crawler_settings.workers.stop_workers_and_wait()
-        if hasattr(signal, 'SIGUSR2'):
-            os.kill(os.getpid(), signal.SIGUSR2)
-        else:
-            response['error'] = "This OS does not support signal SIGUSR2"
-            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
+        try:
+            response["message"] = restart_web_server(request)
+        except WebServerRestartError as e:
+            response["error"] = str(e)
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=401)
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "settings":
-        if request.method == 'POST':
-            if not request.body:
-                response['error'] = 'Empty body'
-                return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
-            data = json.loads(request.body.decode("utf-8"))
-            if 'data' not in data:
-                response['error'] = 'Missing data'
-                return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status_code=401)
-            settings_text = data['data']
-            if os.path.isfile(os.path.join(crawler_settings.default_dir, "settings.yaml")):
-                with open(os.path.join(crawler_settings.default_dir, "settings.yaml"),
-                          "w",
-                          encoding="utf-8"
-                          ) as f:
-                    f.write(settings_text)
-                    logger.info(
-                        'Modified settings file for Panda Backup')
-                    response['message'] = 'Modified settings file for Panda Backup'
-                    return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "restart_workers":
+        import socket
+        from datetime import timedelta
+        import django.utils.timezone as django_tz
+        from workers.models import WorkerProcess, SchedulerState
+
+        heartbeat_cutoff = django_tz.now() - timedelta(seconds=60)
+        active_workers = list(WorkerProcess.objects.filter(status="running", last_heartbeat__gte=heartbeat_cutoff))
+        current_host = socket.gethostname()
+        signaled_pids = []
+        for wp in active_workers:
+            if hasattr(signal, "SIGHUP") and (not wp.hostname or wp.hostname == current_host):
+                try:
+                    os.kill(wp.pid, signal.SIGHUP)
+                    signaled_pids.append(wp.pid)
+                except (OSError, ProcessLookupError, PermissionError) as e:
+                    logger.warning("Could not send SIGHUP to worker PID %d: %s", wp.pid, e)
+
+        SchedulerState.request_command("worker_runner", "restart")
+        logger.info("Requested worker restart (active: %d, signaled: %s)", len(active_workers), signaled_pids)
+
+        if active_workers:
+            response["message"] = f"Restart requested for {len(active_workers)} running worker process(es)."
+            response["worker_pids"] = [wp.pid for wp in active_workers]
         else:
-            if os.path.isfile(os.path.join(crawler_settings.default_dir, "settings.yaml")):
-                with open(os.path.join(crawler_settings.default_dir, "settings.yaml"), "r", encoding="utf-8") as f:
+            response["message"] = "Restart command queued. No actively running workers detected."
+            response["worker_pids"] = []
+        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool == "validate_settings":
+        if request.method != "POST":
+            response["error"] = "POST required"
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=405)
+        try:
+            data = json.loads(request.body.decode("utf-8")) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            response["error"] = "Invalid JSON body"
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8", status=400)
+        settings_text = data.get("data", "")
+        val_result = validate_yaml_settings(settings_text)
+        return HttpResponse(json.dumps(val_result), content_type="application/json; charset=utf-8")
+    elif tool == "settings":
+        if request.method == "POST":
+            if not request.body:
+                response["error"] = "Empty body"
+                return HttpResponse(
+                    json.dumps(response), content_type="application/json; charset=utf-8", status=400
+                )
+            try:
+                data = json.loads(request.body.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                response["error"] = "Invalid JSON body"
+                return HttpResponse(
+                    json.dumps(response), content_type="application/json; charset=utf-8", status=400
+                )
+            if "data" not in data:
+                response["error"] = "Missing data"
+                return HttpResponse(
+                    json.dumps(response), content_type="application/json; charset=utf-8", status=400
+                )
+            settings_text = data["data"]
+            force_save = bool(data.get("force", False))
+            val_result = validate_yaml_settings(settings_text)
+            if not val_result["valid"] and not force_save:
+                response["error"] = val_result["message"]
+                response["validation"] = val_result
+                return HttpResponse(
+                    json.dumps(response), content_type="application/json; charset=utf-8", status=400
+                )
+            settings_path = os.path.join(crawler_settings.default_dir, "settings.yaml")
+            with open(settings_path, "w", encoding="utf-8") as f:
+                f.write(settings_text)
+            logger.info("Modified settings file for Panda Backup")
+            response["message"] = "Modified settings file for Panda Backup"
+            response["validation"] = val_result
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+        else:
+            settings_path = os.path.join(crawler_settings.default_dir, "settings.yaml")
+            if os.path.isfile(settings_path):
+                with open(settings_path, "r", encoding="utf-8") as f:
                     first = f.read(1)
-                    if first != '\ufeff':
+                    if first != "\ufeff":
                         # not a BOM, rewind
                         f.seek(0)
                     settings_text = f.read()
-                    response['data'] = settings_text
-                    return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+                    response["data"] = settings_text
+            else:
+                response["data"] = ""
+            return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
     elif tool == "reload_settings":
         crawler_settings.load_config_from_file()
-        logger.info(
-            'Reloaded settings file for Panda Backup')
-        response['message'] = 'Reloaded settings file for Panda Backup'
+        logger.info("Reloaded settings file for Panda Backup")
+        response["message"] = "Reloaded settings file for Panda Backup"
         return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "start_timed_dl":
-        if crawler_settings.workers.timed_downloader:
-            crawler_settings.workers.timed_downloader.start_running(timer=crawler_settings.timed_downloader_cycle_timer)
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "stop_timed_dl":
-        if crawler_settings.workers.timed_downloader:
-            crawler_settings.workers.timed_downloader.stop_running()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "force_run_timed_dl":
-        if crawler_settings.workers.timed_downloader:
-            crawler_settings.workers.timed_downloader.stop_running()
-            crawler_settings.workers.timed_downloader.force_run_once = True
-            crawler_settings.workers.timed_downloader.start_running(timer=crawler_settings.timed_downloader_cycle_timer)
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "start_timed_updater":
-        if tool_arg:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                if provider_auto_updater.provider_name == tool_arg:
-                    provider_auto_updater.start_running(
-                        timer=crawler_settings.providers[provider_auto_updater.provider_name].autoupdater_timer
-                    )
-                    break
-        else:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                provider_auto_updater.start_running(
-                    timer=crawler_settings.providers[provider_auto_updater.provider_name].autoupdater_timer
-                )
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "stop_timed_updater":
-        if tool_arg:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                if provider_auto_updater.provider_name == tool_arg:
-                    provider_auto_updater.stop_running()
-                    break
-        else:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                provider_auto_updater.stop_running()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "force_run_timed_updater":
-        if tool_arg:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                if provider_auto_updater.provider_name == tool_arg:
-                    provider_auto_updater.stop_running()
-                    provider_auto_updater.force_run_once = True
-                    provider_auto_updater.start_running(
-                        timer=crawler_settings.providers[provider_auto_updater.provider_name].autoupdater_timer
-                    )
-                    break
-        else:
-            for provider_auto_updater in crawler_settings.workers.timed_auto_updaters:
-                provider_auto_updater.stop_running()
-                provider_auto_updater.force_run_once = True
-                provider_auto_updater.start_running(
-                    timer=crawler_settings.providers[provider_auto_updater.provider_name].autoupdater_timer
-                )
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "start_timed_auto_wanted":
-        if crawler_settings.workers.timed_auto_wanted:
-            crawler_settings.workers.timed_auto_wanted.start_running(timer=crawler_settings.auto_wanted.cycle_timer)
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "stop_timed_auto_wanted":
-        if crawler_settings.workers.timed_auto_wanted:
-            crawler_settings.workers.timed_auto_wanted.stop_running()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "force_run_timed_auto_wanted":
-        if crawler_settings.workers.timed_auto_wanted:
-            crawler_settings.workers.timed_auto_wanted.stop_running()
-            crawler_settings.workers.timed_auto_wanted.force_run_once = True
-            crawler_settings.workers.timed_auto_wanted.start_running(timer=crawler_settings.auto_wanted.cycle_timer)
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
-    elif tool == "start_web_queue":
-        if crawler_settings.workers.web_queue:
-            crawler_settings.workers.web_queue.start_running()
-        return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")
+    elif tool in ("config_schema", "settings_schema"):
+        from core.base.config_models import get_config_schema
+
+        schema = get_config_schema()
+        return HttpResponse(json.dumps(schema, indent=2), content_type="application/json; charset=utf-8")
+    elif tool == "default_config":
+        from core.base.config_models import generate_default_yaml_content
+
+        return HttpResponse(generate_default_yaml_content(), content_type="text/yaml; charset=utf-8")
     elif tool == "threads_status":
         threads_status = get_thread_status_bool()
-        return HttpResponse(json.dumps({'data': threads_status}), content_type="application/json; charset=utf-8")
+        return HttpResponse(json.dumps({"data": threads_status}), content_type="application/json; charset=utf-8")
 
-    response['error'] = 'Missing parameters'
+    response["error"] = "Missing parameters"
     return HttpResponse(json.dumps(response), content_type="application/json; charset=utf-8")

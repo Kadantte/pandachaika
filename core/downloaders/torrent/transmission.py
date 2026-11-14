@@ -1,144 +1,127 @@
-from typing import Any, Union, Optional
+import logging
+from typing import Literal, cast, Any
+from urllib.parse import urlparse
 
-import transmissionrpc
+import transmission_rpc
 import os
 
-from base64 import b64encode
-from http.client import BadStatusLine
-import sys
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, build_opener, HTTPSHandler
-import ssl
+from core.base.types import TorrentClient
 
-
-from transmissionrpc.error import HTTPHandlerError
-
-from core.base.types import TorrentClient, DataDict
+logger = logging.getLogger(__name__)
 
 
 class Transmission(TorrentClient):
 
-    name = 'transmission'
-    convert_to_base64 = True
+    name = "transmission"
+    # v4 API needs bytes, not base64 string.
+    convert_to_base64 = False
     send_url = False
 
-    def __init__(self, address: str = 'localhost', port: int = 9091, user: str = '', password: str = '', secure: bool = True) -> None:
+    def __init__(
+        self, address: str = "localhost", port: int = 9091, user: str = "", password: str = "", secure: bool = True
+    ) -> None:
         super().__init__(address=address, port=port, user=user, password=password, secure=secure)
-        self.trans = None
-        self.error = ''
+        self.trans: transmission_rpc.Client | None = None
+        self.error = ""
 
     def __str__(self) -> str:
         return self.name
 
-    def add_url(self, enc_torrent: str, download_dir: Optional[str] = None) -> bool:
-        result = self.add_torrent(enc_torrent, download_dir=download_dir)
+    def add_url(self, torrent_data: str, download_dir: str | None = None) -> tuple[bool, str | None]:
+        result, torrent_id = self.add_torrent(torrent_data, download_dir=download_dir)
         if self.expected_torrent_name and not self.expected_torrent_extension:
             self.expected_torrent_name = os.path.splitext(self.expected_torrent_name)[0]
-        return result
+        return result, torrent_id
 
-    def add_torrent(self, enc_torrent: Union[str, bytes], download_dir: Optional[str] = None) -> bool:
+    def add_torrent(
+        self, torrent_data: str | bytes, download_dir: str | None = None
+    ) -> tuple[bool, str | None]:
 
         if not self.trans:
-            return False
+            return False, None
         self.total_size = 0
 
         if self.set_expected:
-            self.expected_torrent_name = ''
-            self.expected_torrent_extension = ''
+            self.expected_torrent_name = ""
+            self.expected_torrent_extension = ""
 
         try:
-            torr = self.trans.add_torrent(
-                enc_torrent,
-                download_dir=download_dir,
-                timeout=25
-            )
+            torr = self.trans.add_torrent(torrent_data, download_dir=download_dir, timeout=25)
 
             if self.set_expected:
                 self.expected_torrent_name = torr.name
 
-            c = self.trans.get_files(torr.id)
-            for file_t in c[torr.id]:
-                self.total_size += int(c[torr.id][file_t]['size'])
-                if self.set_expected and torr.name == c[torr.id][file_t]['name']:
+            for file_t in torr.get_files():
+                self.total_size += file_t.size
+                if self.set_expected and torr.name == file_t.name:
                     name_split = os.path.splitext(self.expected_torrent_name)
                     self.expected_torrent_name = name_split[0]
                     self.expected_torrent_extension = name_split[1]
 
-            return True
+            # The info hash is stable across client restarts, unlike the session-scoped numeric id.
+            return True, torr.hashString or str(torr.id)
 
-        except transmissionrpc.TransmissionError as e:
+        except transmission_rpc.TransmissionError as e:
             self.error = e.message
-            if 'invalid or corrupt torrent file' in e.message:
-                return False
-            elif 'duplicate torrent' in e.message:
-                return True
+            if "invalid or corrupt torrent file" in e.message:
+                return False, None
+            elif "duplicate torrent" in e.message:
+                return True, None
             else:
-                return False
+                return False, None
 
     def connect(self) -> bool:
         try:
-            if 'https://' in self.address:
-                http_handler: Optional[TransmissionHTTPSHandler] = TransmissionHTTPSHandler(secure=self.secure)
-            else:
-                http_handler = None
-            self.trans = transmissionrpc.Client(
-                address=self.address,
-                user=self.user,
-                password=self.password,
-                http_handler=http_handler
+            address_parts = urlparse(self.address)
+            if address_parts.scheme not in ("http", "https"):
+                return False
+            address_scheme = cast(Literal["http", "https"], address_parts.scheme)
+            extra_arguments: dict[str, Any] = {}
+            if address_parts.hostname is not None:
+                extra_arguments["host"] = address_parts.hostname
+            extra_arguments["port"] = self.port
+            if address_parts.path is not None:
+                extra_arguments["path"] = address_parts.path
+            self.trans = transmission_rpc.Client(
+                protocol=address_scheme, username=self.user, password=self.password, timeout=25, **extra_arguments
             )
-        except transmissionrpc.TransmissionError as e:
+        except transmission_rpc.TransmissionError as e:
             self.error = e.message
             return False
         return True
 
+    def get_download_progress[TorrentKey](
+        self, download_list: list[tuple[str, TorrentKey]]
+    ) -> list[tuple[TorrentKey, float]] | None:
 
-class TransmissionHTTPSHandler(transmissionrpc.HTTPHandler):
+        if not self.trans:
+            return None
 
-    """
-    The default HTTPS handler provided with transmissionrpc.
-    """
+        # Accept info hashes, and numeric ids from events created before hashes were stored.
+        torrent_id_map: dict[int | str, TorrentKey] = {}
+        for dl_id_str, key in download_list:
+            if not dl_id_str or not isinstance(dl_id_str, str):
+                continue
+            cleaned = dl_id_str.strip().lower()
+            if cleaned.isdigit():
+                torrent_id_map[int(cleaned)] = key
+            elif len(cleaned) == 40 and all(c in "0123456789abcdef" for c in cleaned):
+                torrent_id_map[cleaned] = key
 
-    def __init__(self, secure: bool = True) -> None:
-        transmissionrpc.HTTPHandler.__init__(self)
-        self.http_opener = build_opener()
-        self.auth: DataDict = {}
-        self.secure = secure
+        if not torrent_id_map:
+            return []
 
-    def set_authentication(self, uri: str, login: str, password: str) -> None:
-        if self.secure:
-            context = ssl.create_default_context()
-        else:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
-            context.verify_mode = ssl.CERT_NONE
-            context.check_hostname = False
-        self.http_opener = build_opener(HTTPSHandler(context=context))
-        self.auth = {'Authorization': 'Basic %s' %
-                     b64encode(str.encode(login + ":" + password)).decode('utf-8')}
-
-    def request(self, url: str, query: str, headers: dict[Any, Any], timeout: int) -> str:
-        headers = {**self.auth, **headers}
-        request = Request(url, query.encode('utf-8'), headers)
         try:
-            response = self.http_opener.open(request, timeout=timeout)
-        except HTTPError as http_error:
-            if http_error.fp is None:
-                raise HTTPHandlerError(
-                    http_error.filename, http_error.code, http_error.msg, dict(http_error.hdrs))  # type: ignore
-            else:
-                raise HTTPHandlerError(
-                    http_error.filename, http_error.code, http_error.msg,  # type: ignore
-                    dict(http_error.hdrs), http_error.read())  # type: ignore
-        except URLError as url_error:
-            # urllib2.URLError documentation is horrendous!
-            # Try to get the tuple arguments of URLError
-            if hasattr(url_error.reason, 'args') and isinstance(url_error.reason.args, tuple) and len(url_error.reason.args) == 2:
-                raise HTTPHandlerError(
-                    httpcode=url_error.reason.args[0], httpmsg=url_error.reason.args[1])
-            else:
-                raise HTTPHandlerError(
-                    httpmsg='urllib2.URLError: %s' % url_error.reason)
-        except BadStatusLine as line_error:
-            raise HTTPHandlerError(
-                httpmsg='httplib.BadStatusLine: %s' % line_error.line)  # type: ignore
-        return response.read().decode('utf-8')
+            torrents = self.trans.get_torrents(list(torrent_id_map.keys()), timeout=25)
+        except Exception as e:
+            logger.warning(f"Failed to get torrent progress from Transmission: {e}")
+            return None
+
+        results: list[tuple[TorrentKey, float]] = []
+        for torr in torrents:
+            for torrent_id in (torr.id, (torr.hashString or "").lower()):
+                if torrent_id in torrent_id_map:
+                    results.append((torrent_id_map[torrent_id], torr.progress))
+                    break
+
+        return results

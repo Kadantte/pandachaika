@@ -1,4 +1,3 @@
-import os
 import typing
 
 from core.base.types import ProviderSettings
@@ -8,13 +7,13 @@ if typing.TYPE_CHECKING:
 
 
 class OwnSettings(ProviderSettings):
-    def __init__(self, global_settings: 'Settings', config: dict[str, typing.Any]) -> None:
+    def __init__(self, global_settings: "Settings", config: dict[str, typing.Any]) -> None:
         super().__init__(global_settings, config)
-        self.hath_dl_folder = ''
-        self.local_hath_folder = ''
-        self.remote_hath_dir = ''
-        self.archive_dl_folder = ''
-        self.torrent_dl_folder = ''
+        self.hath_dl_folder = ""
+        self.local_hath_folder = ""
+        self.remote_hath_dir = ""
+        self.archive_dl_folder = global_settings.archive_dl_folder
+        self.torrent_dl_folder = global_settings.torrent_dl_folder
         self.accepted_rss_categories = (
             # '[Doujinshi]',
             # '[Manga]',
@@ -33,51 +32,58 @@ class OwnSettings(ProviderSettings):
         self.auto_process_first = False
         self.auto_process_parent = False
         self.mark_relationships = False
+        self.confirm_files_after_download = False
         self.api_concurrent_limit = 4  # Wiki says between 4-5
         self.api_wait_limit = 5.5  # Wiki says 5 seconds
+        self.maximum_gp_cost_for_dls: None | float = None # Maximum cost for hath and archive downloads, if None, don't consider, if number, 0 = only free.
+        self.maximum_gp_mb_ratio_for_dls: None | float = None # Maximum GP/MB cost for hath and archive downloads, if None, don't consider, if number, 0 = only free.
+        self.proceed_with_download_if_lowest_cost = False
 
 
-def parse_config(global_settings: 'Settings', config: dict[str, typing.Any]) -> 'OwnSettings':
+def parse_config(global_settings: "Settings", config: dict[str, typing.Any]) -> "OwnSettings":
 
     settings = OwnSettings(global_settings, config)
 
-    settings.torrent_dl_folder = global_settings.torrent_dl_folder
-    settings.archive_dl_folder = global_settings.archive_dl_folder
 
-    if 'general' in config:
-        if 'accepted_rss_categories' in config['general']:
-            settings.accepted_rss_categories = config['general']['accepted_rss_categories']
-        if 'use_ex_for_fjord' in config['general']:
-            settings.use_ex_for_fjord = config['general']['use_ex_for_fjord']
-        if 'auto_process_newer' in config['general']:
-            settings.auto_process_newer = config['general']['auto_process_newer']
-        if 'auto_process_first' in config['general']:
-            settings.auto_process_first = config['general']['auto_process_first']
-        if 'auto_process_parent' in config['general']:
-            settings.auto_process_parent = config['general']['auto_process_parent']
-        # TODO: Mark galleries when a new gallery in chain is detected
-        if 'mark_relationships' in config['general']:
-            settings.mark_relationships = config['general']['mark_relationships']
-    if 'api' in config:
-        if 'concurrent_limit' in config['api']:
-            settings.api_concurrent_limit = config['api']['concurrent_limit']
-        if 'wait_limit' in config['api']:
-            settings.api_wait_limit = config['api']['wait_limit']
-    if 'locations' in config:
-        if 'archive_dl_folder' in config['locations']:
-            settings.archive_dl_folder = config['locations']['archive_dl_folder']
-            if not os.path.exists(os.path.join(global_settings.MEDIA_ROOT, settings.archive_dl_folder)):
-                os.makedirs(os.path.join(global_settings.MEDIA_ROOT, settings.archive_dl_folder))
-        if 'torrent_dl_folder' in config['locations']:
-            settings.torrent_dl_folder = config['locations']['torrent_dl_folder']
-            if not os.path.exists(os.path.join(global_settings.MEDIA_ROOT, settings.torrent_dl_folder)):
-                os.makedirs(os.path.join(global_settings.MEDIA_ROOT, settings.torrent_dl_folder))
-        if 'hath_dl_folder' in config['locations']:
-            settings.hath_dl_folder = config['locations']['hath_dl_folder']
-            if not os.path.exists(os.path.join(global_settings.MEDIA_ROOT, settings.hath_dl_folder)):
-                os.makedirs(os.path.join(global_settings.MEDIA_ROOT, settings.hath_dl_folder))
-        if 'local_hath_folder' in config['locations']:
-            settings.local_hath_folder = config['locations']['local_hath_folder']
-        if 'remote_hath_dir' in config['locations']:
-            settings.remote_hath_dir = config['locations']['remote_hath_dir']
+    if "general" in config:
+        if "accepted_rss_categories" in config["general"]:
+            settings.accepted_rss_categories = config["general"]["accepted_rss_categories"]
+        if "use_ex_for_fjord" in config["general"]:
+            settings.use_ex_for_fjord = config["general"]["use_ex_for_fjord"]
+        if "auto_process_newer" in config["general"]:
+            settings.auto_process_newer = config["general"]["auto_process_newer"]
+        if "auto_process_first" in config["general"]:
+            settings.auto_process_first = config["general"]["auto_process_first"]
+        if "auto_process_parent" in config["general"]:
+            settings.auto_process_parent = config["general"]["auto_process_parent"]
+        if "mark_relationships" in config["general"]:
+            settings.mark_relationships = config["general"]["mark_relationships"]
+        if "maximum_gp_cost_for_dls" in config["general"]:
+            settings.maximum_gp_cost_for_dls = config["general"]["maximum_gp_cost_for_dls"]
+        if "maximum_gp_mb_ratio_for_dls" in config["general"]:
+            settings.maximum_gp_mb_ratio_for_dls = config["general"]["maximum_gp_mb_ratio_for_dls"]
+        if "proceed_with_download_if_lowest_cost" in config["general"]:
+            settings.proceed_with_download_if_lowest_cost = config["general"]["proceed_with_download_if_lowest_cost"]
+        if "confirm_files_after_download" in config["general"]:
+            settings.confirm_files_after_download = config["general"]["confirm_files_after_download"]
+        if "stop_on_seen_links" in config["general"]:
+            settings.stop_on_seen_links = bool(config["general"]["stop_on_seen_links"])
+        elif "stop_on_seen_link" in config["general"]:
+            settings.stop_on_seen_links = bool(config["general"]["stop_on_seen_link"])
+    if "api" in config:
+        if "concurrent_limit" in config["api"]:
+            settings.api_concurrent_limit = config["api"]["concurrent_limit"]
+        if "wait_limit" in config["api"]:
+            settings.api_wait_limit = config["api"]["wait_limit"]
+    if "locations" in config:
+        if "archive_dl_folder" in config["locations"]:
+            settings.archive_dl_folder = config["locations"]["archive_dl_folder"]
+        if "torrent_dl_folder" in config["locations"]:
+            settings.torrent_dl_folder = config["locations"]["torrent_dl_folder"]
+        if "hath_dl_folder" in config["locations"]:
+            settings.hath_dl_folder = config["locations"]["hath_dl_folder"]
+        if "local_hath_folder" in config["locations"]:
+            settings.local_hath_folder = config["locations"]["local_hath_folder"]
+        if "remote_hath_dir" in config["locations"]:
+            settings.remote_hath_dir = config["locations"]["remote_hath_dir"]
     return settings

@@ -1,5 +1,6 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -26,34 +27,36 @@
   <meta name="msapplication-config" content="{% static 'browserconfig.xml' %}">
   {% load compress %}
   {% compress css %}
-    <link href="{% static 'css/vendor/bootstrap.min.css' %}" rel="stylesheet">
-    <link href="{% static 'css/vendor/fontawesome-all.min.css' %}" rel="stylesheet">
-    <link rel="stylesheet" type="text/css" href="{% static 'css/main.css' %}">
+  <link href="{% static 'css/vendor/bootstrap.min.css' %}" rel="stylesheet">
+  <link href="{% static 'css/vendor/fontawesome-all.min.css' %}" rel="stylesheet">
+  <link rel="stylesheet" type="text/css" href="{% static 'css/main.css' %}">
   {% endcompress %}
-  {% block extrahead %} {% endblock %}
+  {% block extra_head %} {% endblock %}
 </head>
 {% load viewer_extras %}
+
 <body>
-<div class="container-fluid">
-  {% block nav-global %}
+  <div class="container-fluid">
+    {% block nav-global %}
     <!-- MENU -->
     <nav class="navbar navbar-expand-lg navbar-light bg-light py-0 text-nowrap">
-    <div class="container-fluid">
-      <a class="navbar-brand" href="{% url 'viewer:main-page' %}">
-        <img alt="PG" src="{% static 'favicon-32.png' %}" width="28" height="28">
-      </a>
-      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbar" aria-controls="navbar" aria-expanded="false" aria-label="Toggle navigation">
-        <span class="navbar-toggler-icon"></span>
-      </button>
-      <div id="navbar" class="collapse navbar-collapse">
-        <ul class="navbar-nav">
-          <li class="nav-item"><a class="nav-link" href="{% url 'viewer:archive-search' %}">Archives</a></li>
-          <li class="nav-item"><a class="nav-link" href="{% url 'viewer:gallery-list' %}">Galleries</a></li>
-          {% if not user.is_staff %}
-            <li class="nav-item"><a class="nav-link" href="/ripper/">Rips folder</a></li>
+      <div class="container-fluid">
+        <a class="navbar-brand" href="{% url 'viewer:main-page' %}">
+          <img alt="PG" src="{% static 'favicon-32.png' %}" width="28" height="28">
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbar"
+          aria-controls="navbar" aria-expanded="false" aria-label="Toggle navigation">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div id="navbar" class="collapse navbar-collapse">
+          <ul class="navbar-nav">
+            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:archive-search' %}">Archives</a></li>
+            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:gallery-list' %}">Galleries</a></li>
+            {% if not user.is_staff %}
             <li class="nav-item"><a class="nav-link" href="/explorer/">Explorer</a></li>
             <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" id="navbarDropdown" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Help needed</a>
+              <a href="#" class="nav-link dropdown-toggle" id="navbarDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Help needed</a>
               <ul class="dropdown-menu" aria-labelledby="navbarDropdown">
                 <a class="dropdown-item" href="{% url 'viewer:public-missing-archives' %}">Missing archives</a>
                 <a class="dropdown-item" href="{% url 'viewer:wanted-galleries' %}">Wanted galleries</a>
@@ -61,153 +64,215 @@
             </li>
             {% if user.is_authenticated %}
             <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" id="navbarDropdown" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Collaborator</a>
+              <a href="#" class="nav-link dropdown-toggle" id="navbarDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Collaborator</a>
               <ul class="dropdown-menu" aria-labelledby="navbarDropdown">
                 {% if perms.viewer.view_submitted_gallery %}
-                  <a class="dropdown-item" href="{% url 'viewer:submit-queue' %}">Submit queue</a>
+                <a class="dropdown-item" href="{% url 'viewer:submit-queue' %}">Submit queue</a>
                 {% endif %}
                 {% if perms.viewer.manage_archive %}
-                  <a class="dropdown-item" href="{% url 'viewer:manage-archives' %}?non_public=1">Manage archives</a>
-                  <a class="dropdown-item" href="{% url 'viewer:archives-by-field' %}">Similar archives by field</a>
+                <a class="dropdown-item" href="{% url 'viewer:manage-archives' %}?non_public=1">Manage archives</a>
+                <a class="dropdown-item" href="{% url 'viewer:archive-manager' %}">Archive Manager App</a>
+                <a class="dropdown-item" href="{% url 'viewer:archives-by-field' %}">Similar archives by field</a>
+                {% endif %}
+                {% if perms.viewer.manage_gallery %}
+                <a class="dropdown-item" href="{% url 'viewer:manage-galleries' %}">Manage galleries</a>
+                <a class="dropdown-item" href="{% url 'viewer:galleries-by-field' %}">Similar galleries by field</a>
+                <a class="dropdown-item" href="{% url 'viewer:gallery-match-groups' %}">Gallery Match Groups Listing</a>
+                <a class="dropdown-item" href="{% url 'viewer:gallery-match-groups-batch' %}">Gallery Match Groups
+                  Batch</a>
                 {% endif %}
                 {% if perms.viewer.crawler_adder %}
-                  <a class="dropdown-item" href="{% url 'viewer:user-crawler' %}">Add URLs</a>
+                <a class="dropdown-item" href="{% url 'viewer:user-crawler' %}">Add URLs</a>
+                {% endif %}
+                {% if perms.viewer.download_history %}
+                <a class="dropdown-item" href="{% url 'viewer:downloads' %}">Download Monitor</a>
                 {% endif %}
                 {% if perms.viewer.upload_with_metadata_archive %}
-                  <a class="dropdown-item" href="{% url 'viewer:upload-archive' %}">Upload archive</a>
+                <a class="dropdown-item" href="{% url 'viewer:upload-archive' %}">Upload archive</a>
+                {% endif %}
+                {% if perms.viewer.add_gallery %}
+                <a class="dropdown-item" href="{% url 'viewer:upload-gallery' %}">Add gallery</a>
                 {% endif %}
                 {% if perms.viewer.match_archive %}
-                  <a class="dropdown-item" href="{% url 'viewer:match-archives' %}">Match archives</a>
+                <a class="dropdown-item" href="{% url 'viewer:match-archives' %}">Match archives</a>
                 {% endif %}
                 {% if perms.viewer.view_wantedgallery %}
-                  <a class="dropdown-item" href="{% url 'viewer:col-wanted-galleries' %}">Wanted galleries</a>
+                <a class="dropdown-item" href="{% url 'viewer:wanted-galleries' %}">Wanted galleries</a>
                 {% endif %}
                 {% if perms.viewer.manage_missing_archives %}
-                  <a class="dropdown-item" href="{% url 'viewer:col-missing-archives' %}?provider=panda">Manage missing archives</a>
+                <a class="dropdown-item" href="{% url 'viewer:col-missing-archives' %}?provider=panda">Manage missing
+                  archives</a>
                 {% endif %}
                 {% if perms.viewer.read_activity_logs %}
-                  <a class="dropdown-item" href="{% url 'viewer:activity-event-log' %}">Activity log</a>
+                <a class="dropdown-item" href="{% url 'viewer:activity-event-log' %}">Activity log</a>
                 {% endif %}
                 {% if perms.viewer.view_monitored_links %}
-                  <a class="dropdown-item" href="{% url 'viewer:monitored-links' %}">Monitored Links</a>
+                <a class="dropdown-item" href="{% url 'viewer:monitored-links' %}">Monitored Links</a>
                 {% endif %}
                 {% if perms.viewer.read_private_stats %}
-                  <a class="dropdown-item" href="{% url 'viewer:stats-collection' %}">General Stats</a>
+                <a class="dropdown-item" href="{% url 'viewer:stats-collection' %}">General Stats</a>
                 {% endif %}
                 {% if perms.viewer.compare_archives %}
-                  <a class="dropdown-item" href="{% url 'viewer:compare-archives-viewer' %}">Compare archives</a>
+                <a class="dropdown-item" href="{% url 'viewer:compare-archives-viewer' %}">Compare archives</a>
                 {% endif %}
-                  <div class="dropdown-divider"></div>
-                  <a class="dropdown-item" href="{% url 'viewer:archive-groups' %}">Archive Groups</a>
+                <div class="dropdown-divider"></div>
+                <a class="dropdown-item" href="{% url 'viewer:archive-groups' %}">Archive Groups</a>
+                <a class="dropdown-item" href="{% url 'viewer:stats-visualizations' %}">Visualizations</a>
               </ul>
             </li>
             {% endif %}
             <li class="nav-item"><a class="nav-link" href="{% url 'viewer:url-submit' %}">Submit URLs</a></li>
-          {% endif %}
-          {% if user.is_staff %}
-            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:tools' %}">Tools</a></li>
-            <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Lists</a>
-              <ul class="dropdown-menu">
-                <a class="dropdown-item" href="{% url 'viewer:repeated-archives' %}">Repeated archives (same gallery)</a>
-                <a class="dropdown-item" href="{% url 'viewer:archives-by-field' %}">Similar archives by field</a>
-                <a class="dropdown-item" href="{% url 'viewer:galleries-by-field' %}">Repeated galleries by field</a>
-                <a class="dropdown-item" href="{% url 'viewer:archive-filesize-different' %}">Archives not matching gallery filesize</a>
-                <a class="dropdown-item" href="{% url 'viewer:archive-not-present' %}">Archives with file not present in filesystem</a>
-                <a class="dropdown-item" href="{% url 'viewer:archives-not-matched' %}">Archives without gallery matches</a>
-                <div class="dropdown-divider"></div>
-                <a class="dropdown-item" href="{% url 'viewer:wanted-galleries' %}?{% url_replace 'wanted-not-found' '1' %}">Wanted galleries</a>
-                <a class="dropdown-item" href="{% url 'viewer:found-galleries' %}">Found galleries log</a>
-                <div class="dropdown-divider"></div>
-                <a class="dropdown-item" href="{% url 'viewer:submit-queue' %}">Submit queue</a>
-                <a class="dropdown-item" href="{% url 'viewer:manage-archives' %}?non_public=1">Manage archives</a>
-                <a class="dropdown-item" href="{% url 'viewer:user-crawler' %}">Add URLs</a>
-                <a class="dropdown-item" href="{% url 'viewer:upload-archive' %}">Upload archive</a>
-                <a class="dropdown-item" href="{% url 'viewer:match-archives' %}">Match archives</a>
-                <a class="dropdown-item" href="{% url 'viewer:col-wanted-galleries' %}">Wanted galleries</a>
-                <a class="dropdown-item" href="{% url 'viewer:col-missing-archives' %}?provider=panda">Manage missing archives</a>
-                <a class="dropdown-item" href="{% url 'viewer:activity-event-log' %}">Activity log</a>
-                <a class="dropdown-item" href="{% url 'viewer:monitored-links' %}">Monitored Links</a>
-              </ul>
-            </li>
-            <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Stats</a>
-              <ul class="dropdown-menu">
-                <a class="dropdown-item" href="{% url 'viewer:stats-collection' %}">Collection</a>
-                <a class="dropdown-item" href="{% url 'viewer:stats-workers' %}">Workers</a>
-                <a class="dropdown-item" href="{% url 'viewer:stats-settings' %}">Settings</a>
-              </ul>
-            </li>
-            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:logs' %}">Logs</a></li>
+            {% endif %}
+            {% if user.is_staff %}
             <li class="nav-item"><a class="nav-link" href="{% url 'viewer:crawler' %}">URL Crawler</a></li>
-            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:folder-crawler' %}">Folder Crawler</a></li>
+
+            <!-- Manage Menu -->
             <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Other tools</a>
-              <ul class="dropdown-menu">
-                <a class="dropdown-item" href="/explorer/">Explorer</a>
-                <a class="dropdown-item" href="{% url 'viewer:es-index-view' %}">Advanced search (Archive)</a>
-                <a class="dropdown-item" href="{% url 'viewer:es-gallery-index-view' %}">Advanced search (Gallery)</a>
-                <a class="dropdown-item" href="{% url 'viewer:public-stats' %}">Collection stats</a>
-                <a class="dropdown-item" href="{% url 'viewer:archive-groups' %}">Archive Groups</a>
-                <a class="dropdown-item" href="{% url 'viewer:compare-archives-viewer' %}">Compare archives</a>
-                <a class="dropdown-item" href="{% url 'viewer:public-missing-archives' %}">Public missing galleries</a>
+              <a href="#" class="nav-link dropdown-toggle" id="manageDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Manage</a>
+              <ul class="dropdown-menu" aria-labelledby="manageDropdown">
+                <li><h6 class="dropdown-header">Archives &amp; Galleries</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:manage-archives' %}?non_public=1">Manage archives</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archive-manager' %}">Archive Manager App</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:manage-galleries' %}">Manage galleries</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:submit-queue' %}">Submit queue</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:match-archives' %}">Match archives</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:col-missing-archives' %}?provider=panda">Manage missing archives</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:wanted-galleries' %}">Wanted galleries</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><h6 class="dropdown-header">Ingestion &amp; Crawlers</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:user-crawler' %}">Add URLs</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:crawler' %}">URL Crawler</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:folder-crawler' %}">Folder Crawler</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:upload-archive' %}">Upload archive</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:upload-gallery' %}">Add gallery</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:downloads' %}">Download Monitor</a></li>
               </ul>
             </li>
-          {% else %}
+
+            <!-- Data & Tools Menu -->
             <li class="nav-item dropdown">
-              <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Other tools</a>
+              <a href="#" class="nav-link dropdown-toggle" id="dataDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Data</a>
+              <ul class="dropdown-menu" aria-labelledby="dataDropdown">
+                <li><h6 class="dropdown-header">Audits &amp; Consistency</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:repeated-archives' %}">Repeated archives (same gallery)</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archives-by-field' %}">Similar archives by field</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:galleries-by-field' %}">Similar galleries by field</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:gallery-match-groups' %}">Gallery Match Groups Listing</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:gallery-match-groups-batch' %}">Gallery Match Groups Batch</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archive-filesize-different' %}">Archives not matching gallery filesize</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archive-file-check' %}">Archive file check (missing / corrupted)</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archives-not-matched' %}">Archives without gallery matches</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><h6 class="dropdown-header">Search &amp; Exploration</h6></li>
+                <li><a class="dropdown-item" href="/explorer/">Explorer</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:image-search' %}">Image Search</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:es-index-view' %}">Advanced search (Archive)</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:es-gallery-index-view' %}">Advanced search (Gallery)</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:archive-groups' %}">Archive Groups</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:compare-archives-viewer' %}">Compare archives</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:public-missing-archives' %}">Public missing galleries</a></li>
+                <li><hr class="dropdown-divider"></li>
+                <li><h6 class="dropdown-header">Activity &amp; Tracking</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:activity-event-log' %}">Activity log</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:found-galleries' %}">Found galleries log</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:monitored-links' %}">Monitored Links</a></li>
+              </ul>
+            </li>
+
+            <!-- Stats Menu -->
+            <li class="nav-item dropdown">
+              <a href="#" class="nav-link dropdown-toggle" id="statsDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Stats</a>
+              <ul class="dropdown-menu" aria-labelledby="statsDropdown">
+                <li><a class="dropdown-item" href="{% url 'viewer:stats-collection' %}">Collection</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:stats-visualizations' %}">Visualizations</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:public-stats' %}">Public / Backup stats</a></li>
+              </ul>
+            </li>
+
+            <!-- Settings & Operations Menu -->
+            <li class="nav-item dropdown">
+              <a href="#" class="nav-link dropdown-toggle" id="settingsDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Settings</a>
+              <ul class="dropdown-menu" aria-labelledby="settingsDropdown">
+                <li><h6 class="dropdown-header">Operations &amp; Maintenance</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:tools' %}">Tools</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:stats-workers' %}">Workers Dashboard</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:logs' %}">Server Logs</a></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:database-maintenance' %}">Database Maintenance</a></li>
+                {% if user.is_superuser %}
+                <li><hr class="dropdown-divider"></li>
+                <li><h6 class="dropdown-header">System</h6></li>
+                <li><a class="dropdown-item" href="{% url 'viewer:stats-settings' %}">Configuration</a></li>
+                {% endif %}
+              </ul>
+            </li>
+            {% else %}
+            <li class="nav-item dropdown">
+              <a href="#" class="nav-link dropdown-toggle" data-bs-toggle="dropdown" role="button" aria-haspopup="true"
+                aria-expanded="false">Other tools</a>
               <ul class="dropdown-menu">
                 <a class="dropdown-item" href="{% url 'viewer:es-index-view' %}">Advanced search (Archive)</a>
                 <a class="dropdown-item" href="{% url 'viewer:es-gallery-index-view' %}">Advanced search (Gallery)</a>
+                <a class="dropdown-item" href="{% url 'viewer:image-search' %}">Image Search</a>
                 <a class="dropdown-item" href="{% url 'viewer:public-stats' %}">Backup stats</a>
                 <a class="dropdown-item" href="/public/stats.html">Full Metadata stats</a>
                 <a class="dropdown-item" href="{% url 'viewer:found-galleries' %}">Found galleries log</a>
               </ul>
             </li>
             <li class="nav-item"><a class="nav-link" href="{% url 'viewer:about' %}">About</a></li>
-          {% endif %}
-        </ul>
-        <form action="{% url 'viewer:archive-search' %}" class="d-inline w-100 mx-2 my-auto" role="search">
-          <div class="input-group">
-            <input class="form-control me-sm-2" name="qsearch" placeholder="Title or source URL archive quick search" autocomplete="off" value="{{ display_prms.qsearch }}" type="search" aria-label="quick text">
-            <span>
-            <button class="btn btn-secondary my-2 my-sm-0" type="submit" aria-label="quick search"><i class="fas fa-search"></i></button>
-            <button class="btn btn-secondary my-2 my-sm-0 collapse-icon" id="more" data-bs-toggle="collapse" data-bs-target="#main-search" name="main_filters" type="button" aria-label="toggle search"><i class="fas fa-chevron-{% if prm.main_filters %}up{% else %}down{% endif %}"></i></button>
-            </span>
-          </div>
-        </form>
-        <ul class="navbar-nav">
+            {% endif %}
+          </ul>
+          <form action="{% url 'viewer:archive-search' %}" class="d-inline w-100 mx-2 my-auto" role="search">
+            <div class="input-group">
+              <input class="form-control me-sm-2" name="qsearch"
+                placeholder="Title, source URL or SHA1 image archive quick search" autocomplete="off"
+                value="{{ display_prms.qsearch }}" type="search" aria-label="quick text">
+              <span>
+                <button class="btn btn-secondary my-2 my-sm-0" type="submit" aria-label="quick search"><i
+                    class="fas fa-search"></i></button>
+                <button class="btn btn-secondary my-2 my-sm-0 collapse-icon" id="more" data-bs-toggle="collapse"
+                  data-bs-target="#main-search" name="main_filters" type="button" aria-label="toggle search"><i
+                    class="fas fa-chevron-{% if prm.main_filters %}up{% else %}down{% endif %}"></i></button>
+              </span>
+            </div>
+          </form>
+          <ul class="navbar-nav">
             {% if user.is_staff %}
-              <li class="nav-item"><a class="nav-link" href="{% url 'admin:index' %}">Admin</a></li>
+            <li class="nav-item"><a class="nav-link" href="{% url 'admin:index' %}">Admin</a></li>
             {% endif %}
             {% if user.is_authenticated %}
-              <li class="nav-item dropdown">
-                <a href="#" class="nav-link dropdown-toggle" id="accountDropdown" data-bs-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false">Account</a>
-                <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="accountDropdown">
-                  <a class="dropdown-item" href="{% url 'viewer:my-event-log' %}">Event log</a>
-                  <a class="dropdown-item" href="{% url 'viewer:change-profile' %}">User profile</a>
-                  <a class="dropdown-item" href="{% url 'viewer:change-password' %}">Change password</a>
-                  <a class="dropdown-item" href="{% url 'viewer:logout' %}">Logout</a>
-                </ul>
-              </li>
+            <li class="nav-item dropdown">
+              <a href="#" class="nav-link dropdown-toggle" id="accountDropdown" data-bs-toggle="dropdown" role="button"
+                aria-haspopup="true" aria-expanded="false">Account</a>
+              <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="accountDropdown">
+                <a class="dropdown-item" href="{% url 'viewer:my-event-log' %}">Event log</a>
+                <a class="dropdown-item" href="{% url 'viewer:change-profile' %}">User profile</a>
+                <a class="dropdown-item" href="{% url 'viewer:change-password' %}">Change password</a>
+                <a class="dropdown-item" href="{% url 'viewer:logout' %}">Logout</a>
+              </ul>
+            </li>
             {% else %}
-              <li class="nav-item"><a class="nav-link" href="{% url 'viewer:login' %}">Login</a></li>
+            <li class="nav-item"><a class="nav-link" href="{% url 'viewer:login' %}">Login</a></li>
             {% endif %}
-        </ul>
+          </ul>
+        </div>
       </div>
-    </div>
     </nav>
-  {% endblock %}
-  <!-- CONTENT -->
-  <div id="content">
-    {% block content %}{% endblock %}
+    {% endblock %}
+    <!-- CONTENT -->
+    <div id="content">
+      {% block content %}{% endblock %}
+    </div>
   </div>
-</div>
-<script type="text/javascript" src="{% static "admin/js/vendor/jquery/jquery.min.js" %}"></script>
-{% compress js %}
+  {% compress js %}
   <script src="{% static 'js/vendor/bootstrap.bundle.min.js' %}"></script>
   <script src="{% static 'js/main.js' %}"></script>
-{% endcompress %}
-{% block afterJQ %}{% endblock %}
+  {% endcompress %}
+  {% block afterJQ %}{% endblock %}
 </body>
+
 </html>

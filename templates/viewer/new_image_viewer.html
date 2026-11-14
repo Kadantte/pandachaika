@@ -3,8 +3,8 @@
 {% block sidebar %}{% endblock %}
 {% load static %}
 {% load django_vite %}
-{% block extrahead %}
-{% vite_asset 'src/main.tsx' config="image_viewer" %}
+{% block extra_head %}
+{% vite_asset 'src/main.tsx' app="image_viewer" %}
 {% endblock %}
 
 {% block content %}

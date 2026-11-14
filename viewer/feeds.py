@@ -1,9 +1,9 @@
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import Any
 
 from datetime import datetime
 from django.contrib.syndication.views import Feed
-from django.core.paginator import EmptyPage, Paginator
+from django.core.paginator import Paginator
 from django.http import HttpRequest
 
 from viewer.models import Archive
@@ -23,8 +23,8 @@ class LatestArchivesFeed(Feed):
         args = request.GET.copy()
 
         params = {
-            'sort': 'create_date',
-            'asc_desc': 'desc',
+            "sort": "create_date",
+            "asc_desc": "desc",
         }
 
         for k, v in args.items():
@@ -33,31 +33,36 @@ class LatestArchivesFeed(Feed):
 
         for k in archive_filter_keys:
             if k not in params:
-                params[k] = ''
+                params[k] = ""
 
         results = filter_archives_simple(params, authenticated=request.user.is_authenticated)
 
         if not request.user.is_authenticated:
-            results = results.filter(public=True).order_by('-public_date')
+            results = results.filter(public=True).order_by("-public_date")
 
-        paginator = Paginator(results, 50)
+        results = results.prefetch_related("tags")
+
         try:
-            page = int(request.GET.get("page", '1'))
+            page = int(request.GET.get("page", "1"))
         except ValueError:
             page = 1
-        try:
-            archives = paginator.page(page)
-        except EmptyPage:
-            # If page is out of range (e.g. 9999), deliver last page of results.
-            archives = paginator.page(paginator.num_pages)
+
+        if page <= 1:
+            return results[:50]
+
+        offset = (page - 1) * 50
+        archives = list(results[offset : offset + 50])
+        if not archives:
+            paginator = Paginator(results, 50)
+            return paginator.page(paginator.num_pages)
 
         return archives
 
     def item_title(self, item: Archive) -> str:
-        return item.title or item.title_jpn or ''
+        return item.title or item.title_jpn or ""
 
     def item_description(self, item: Archive) -> str:
         return item.tags_str()
 
-    def item_pubdate(self, item: Archive) -> Optional[datetime]:
+    def item_pubdate(self, item: Archive) -> datetime | None:
         return item.public_date

@@ -1,13 +1,20 @@
 import base64
 import logging
 import os
-from typing import Any, Optional, cast
+from typing import Any, cast
 
 import requests
 
 from core.base.types import DataDict
-from core.base.utilities import replace_illegal_name, available_filename, get_filename_from_cd, get_zip_fileinfo_for_gallery, \
-    calc_crc32, construct_request_dict, remove_archive_extensions
+from core.base.utilities import (
+    construct_request_dict,
+    replace_illegal_name,
+    available_filename,
+    get_filename_from_cd,
+    get_zip_fileinfo_for_gallery,
+    calc_crc32,
+    remove_archive_extensions,
+)
 from core.downloaders.torrent import get_torrent_client
 
 from core.downloaders.handlers import BaseDownloader, BaseGalleryDLDownloader
@@ -18,14 +25,15 @@ logger = logging.getLogger(__name__)
 
 class GenericTorrentDownloader(BaseDownloader):
 
-    type = 'torrent'
-    provider = 'generic'
+    type = "torrent"
+    provider = "generic"
     archive_only = True
+    direct_downloader = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.expected_torrent_name = ''
-        self.expected_torrent_extension = ''
+        self.expected_torrent_name = ""
+        self.expected_torrent_extension = ""
 
     @staticmethod
     def get_download_link(url: str) -> str:
@@ -46,45 +54,36 @@ class GenericTorrentDownloader(BaseDownloader):
 
         logger.info("Adding torrent to client.")
         client.connect()
-        if client.send_url or torrent_link.startswith('magnet:'):
-            result = client.add_url(
-                torrent_link,
-                download_dir=self.settings.torrent['download_dir']
-            )
+        if client.send_url or torrent_link.startswith("magnet:"):
+            result, torrent_id = client.add_url(torrent_link, download_dir=os.path.join(self.settings.torrent["download_dir"], str(self.gallery.gid)))
         else:
             torrent_data = self.general_utils.get_torrent(
-                torrent_link,
-                self.own_settings.cookies,
-                convert_to_base64=client.convert_to_base64
+                torrent_link, self.own_settings.cookies, convert_to_base64=client.convert_to_base64
             )
 
-            result = client.add_torrent(
-                torrent_data,
-                download_dir=self.settings.torrent['download_dir']
-            )
-            if client.expected_torrent_name == '':
+            result, torrent_id = client.add_torrent(torrent_data, download_dir=os.path.join(self.settings.torrent["download_dir"], str(self.gallery.gid)))
+            if client.expected_torrent_name == "":
                 from core.libs.bencoding import Decoder
+
                 try:
                     if client.convert_to_base64 and isinstance(torrent_data, str):
-                        torrent_data = cast(str, torrent_data)
-                        torrent_metadata = Decoder(base64.decodebytes(torrent_data.encode('utf-8'))).decode()
+                        torrent_metadata = Decoder(base64.decodebytes(torrent_data.encode("utf-8"))).decode()
                     else:
                         torrent_data = cast(bytes, torrent_data)
                         torrent_metadata = Decoder(torrent_data).decode()
-                    client.expected_torrent_name = os.path.splitext(torrent_metadata[b'info'][b'name'])[0]
-                    client.expected_torrent_extension = os.path.splitext(torrent_metadata[b'info'][b'name'])[1]
+                    client.expected_torrent_name = os.path.splitext(torrent_metadata[b"info"][b"name"])[0]
+                    client.expected_torrent_extension = os.path.splitext(torrent_metadata[b"info"][b"name"])[1]
                 except (RuntimeError, EOFError):
                     self.return_code = 0
                     logger.error("Error decoding torrent data: {!r}".format(torrent_data))
                     return
 
         if result:
+            self.download_id = torrent_id
             if client.expected_torrent_name:
                 self.expected_torrent_name = client.expected_torrent_name
             else:
-                self.expected_torrent_name = "{}".format(
-                    replace_illegal_name(self.gallery.link)
-                )
+                self.expected_torrent_name = "{}".format(replace_illegal_name(self.gallery.link))
             if client.expected_torrent_extension:
                 self.expected_torrent_extension = client.expected_torrent_extension
             else:
@@ -95,42 +94,44 @@ class GenericTorrentDownloader(BaseDownloader):
                 self.gallery.filesize = client.total_size
             else:
                 self.gallery.filesize = 0
+
+            if not self.expected_torrent_name.endswith(self.expected_torrent_extension):
+                final_name = replace_illegal_name(self.expected_torrent_name) + self.expected_torrent_extension
+            else:
+                final_name = replace_illegal_name(self.expected_torrent_name)
+
             self.gallery.filename = available_filename(
-                self.settings.MEDIA_ROOT,
-                os.path.join(
-                    self.own_settings.torrent_dl_folder,
-                    replace_illegal_name(self.expected_torrent_name) + self.expected_torrent_extension
-                )
+                self.settings.MEDIA_ROOT, os.path.join(self.own_settings.torrent_dl_folder, final_name)
             )
         else:
             self.return_code = 0
-            logger.error("There was an error adding the torrent to the client")
+            logger.error(
+                "There was an error adding the torrent to the client, torrent link: {}, error in client {}:".format(
+                    torrent_link, client.error
+                )
+            )
 
-    def update_archive_db(self, default_values: DataDict) -> Optional['Archive']:
+    def update_archive_db(self, default_values: DataDict) -> "Archive | None":
 
         if not self.gallery:
             return None
 
         values = {
-            'title': self.expected_torrent_name,
-            'title_jpn': '',
-            'zipped': self.gallery.filename,
-            'crc32': self.crc32,
-            'filesize': self.gallery.filesize,
-            'filecount': 0,
+            "title": self.expected_torrent_name,
+            "title_jpn": "",
+            "zipped": self.gallery.filename,
+            "crc32": self.crc32,
+            "filesize": self.gallery.filesize,
+            "filecount": 0,
         }
         default_values.update(values)
-        return Archive.objects.update_or_create_by_values_and_gid(
-            default_values,
-            None,
-            zipped=self.gallery.filename
-        )
+        return Archive.objects.update_or_create_by_values_and_gid(default_values, None, zipped=self.gallery.filename)
 
 
 class GenericArchiveDownloader(BaseDownloader):
 
-    type = 'archive'
-    provider = 'generic'
+    type = "archive"
+    provider = "generic"
     archive_only = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -145,85 +146,113 @@ class GenericArchiveDownloader(BaseDownloader):
         if not self.gallery or not self.gallery.link:
             return
 
-        logger.info("Downloading an archive from a generic HTTP server: {}".format(
-            self.gallery.link
-        ))
+        logger.info("Downloading an archive from a generic HTTP server: {}".format(self.gallery.link))
 
         request_dict = construct_request_dict(self.settings, self.own_settings)
 
-        request_file = requests.get(
-            self.gallery.link,
-            stream=True,
-            **request_dict
-        )
-
-        filename = get_filename_from_cd(request_file.headers.get('content-disposition'))
-
-        if not filename:
-            if self.gallery.link.find('/'):
-                filename = self.gallery.link.rsplit('/', 1)[1]
-
-        if not filename:
-            logger.error("Could not find a filename for link: {}".format(
-                self.gallery.link
-            ))
-            self.return_code = 0
-
-        filename = replace_illegal_name(filename)
-
-        self.gallery.title = remove_archive_extensions(filename)
-        self.gallery.filename = available_filename(
-            self.settings.MEDIA_ROOT,
-            os.path.join(
-                self.own_settings.archive_dl_folder,
-                filename
+        if self.should_queue_archive_download():
+            filename = ""
+            if "/" in self.gallery.link:
+                filename = self.gallery.link.rstrip("/").rsplit("/", 1)[1]
+            if not filename:
+                filename = f"archive_{self.gallery.gid or 'generic'}.zip"
+            filename = replace_illegal_name(filename)
+            if not filename.lower().endswith(".zip") and not filename.lower().endswith(".cbz"):
+                filename += ".zip"
+            self.gallery.title = remove_archive_extensions(filename)
+            self.gallery.filename = available_filename(
+                self.settings.MEDIA_ROOT, os.path.join(self.own_settings.archive_dl_folder, filename)
             )
-        )
+            filepath = os.path.join(self.settings.MEDIA_ROOT, self.gallery.filename)
+            self.enqueue_archive_download(
+                self.gallery.link,
+                filepath,
+                request_dict=request_dict,
+                rate_limit_provider=self.provider,
+                rate_limit_period=self.own_settings.wait_timer,
+                extra_options={
+                    "determine_filename_from_cd": True,
+                    "archive_dl_folder": self.own_settings.archive_dl_folder,
+                },
+            )
+            return
 
-        logger.info("Chosen local filename: {}".format(
-            self.gallery.filename
-        ))
+        for attempt in range(3):
+            try:
+                request_file = requests.get(self.gallery.link, stream=True, **request_dict)
 
-        filepath = os.path.join(self.settings.MEDIA_ROOT,
-                                self.gallery.filename)
-        with open(filepath, 'wb') as fo:
-            for chunk in request_file.iter_content(4096):
-                fo.write(chunk)
+                filename = get_filename_from_cd(request_file.headers.get("content-disposition"))
 
-        self.gallery.filesize, self.gallery.filecount = get_zip_fileinfo_for_gallery(filepath)
-        if self.gallery.filesize > 0:
-            self.crc32 = calc_crc32(filepath)
+                if not filename:
+                    if self.gallery.link.find("/"):
+                        filename = self.gallery.link.rsplit("/", 1)[1]
 
-            self.fileDownloaded = 1
-            self.return_code = 1
+                if not filename:
+                    logger.error("Could not find a filename for link: {}".format(self.gallery.link))
+                    continue
 
-        else:
+                filename = replace_illegal_name(filename)
+
+                self.gallery.title = remove_archive_extensions(filename)
+                self.gallery.filename = available_filename(
+                    self.settings.MEDIA_ROOT, os.path.join(self.own_settings.archive_dl_folder, filename)
+                )
+
+                logger.info("Chosen local filename: {} (Attempt {}/3)".format(self.gallery.filename, attempt + 1))
+
+                filepath = os.path.join(self.settings.MEDIA_ROOT, self.gallery.filename)
+                total_size = int(request_file.headers.get("Content-Length", 0))
+                self.download_event = self.create_download_event(self.gallery.link, self.type, filepath, total_size=total_size)
+                with open(filepath, "wb") as fo:
+                    for chunk in request_file.iter_content(4096):
+                        fo.write(chunk)
+
+                self.gallery.filesize, self.gallery.filecount = get_zip_fileinfo_for_gallery(filepath)
+                if self.gallery.filesize > 0:
+                    self.crc32 = calc_crc32(filepath)
+
+                    self.fileDownloaded = 1
+                    self.return_code = 1
+                    break
+
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError
+            ) as e:
+                logger.warning("Download failed on attempt {}/3 with error: {}".format(attempt + 1, str(e)))
+                if hasattr(self.gallery, 'filename') and self.gallery.filename:
+                    filepath = os.path.join(self.settings.MEDIA_ROOT, self.gallery.filename)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                if self.download_event:
+                    self.download_event.set_as_failed()
+                    self.download_event.save()
+                    self.download_event = None
+
+        if self.return_code != 1:
             logger.error("Could not download archive")
             self.return_code = 0
 
-    def update_archive_db(self, default_values: DataDict) -> Optional['Archive']:
+    def update_archive_db(self, default_values: DataDict) -> "Archive | None":
 
         if not self.gallery:
             return None
 
         values = {
-            'title': self.gallery.title,
-            'title_jpn': self.gallery.title_jpn,
-            'zipped': self.gallery.filename,
-            'crc32': self.crc32,
-            'filesize': self.gallery.filesize,
-            'filecount': self.gallery.filecount,
+            "title": self.gallery.title,
+            "title_jpn": self.gallery.title_jpn,
+            "zipped": self.gallery.filename,
+            "crc32": self.crc32,
+            "filesize": self.gallery.filesize,
+            "filecount": self.gallery.filecount,
         }
         default_values.update(values)
-        return Archive.objects.update_or_create_by_values_and_gid(
-            default_values,
-            None,
-            zipped=self.gallery.filename
-        )
+        return Archive.objects.update_or_create_by_values_and_gid(default_values, None, zipped=self.gallery.filename)
 
 
 class GenericGalleryDLDownloader(BaseGalleryDLDownloader):
-    provider = 'generic'
+    provider = "generic"
     archive_only = True
 
 

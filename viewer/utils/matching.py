@@ -1,16 +1,27 @@
 import logging
+import threading
 import traceback
-
-import time
-from collections.abc import Iterable
+from typing import Any
+from collections.abc import Callable, Iterable
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import QuerySet, Q
+from django.db.models import QuerySet
 
-from core.base.comparison import get_list_closer_gallery_titles_from_list
-from core.base.utilities import replace_illegal_name, get_title_from_path, clean_title
-from viewer.models import GalleryMatch, Archive, Gallery, ArchiveMatches, FoundGallery, ArchiveQuerySet, ItemProperties, Image
+from core.base.comparison import get_list_closer_text_from_list
+from core.base.utilities import replace_illegal_name, get_title_from_path, clean_title as clean_title_text
+from core.matching.engine import MatchingEngine, MatchingOptions, MatchingReport, available_offline_methods
+from core.matching.local import GalleryScope, LocalTitleMatcher
+from core.matching.types import MatchingMode, MatchTarget
+from viewer.models import (
+    GalleryMatch,
+    Archive,
+    Gallery,
+    FoundGallery,
+    ItemProperties,
+    GalleryMatchGroup,
+    GalleryGroupPossibleMatches
+)
 
 crawler_settings = settings.CRAWLER_SETTINGS
 
@@ -18,510 +29,332 @@ logger = logging.getLogger(__name__)
 
 
 # WantedGallery
-def create_matches_wanted_galleries_from_providers(
-        wanted_galleries: QuerySet, provider: str,
-        cutoff: float = 0.4, max_matches: int = 20
-) -> None:
-
-    try:
-        matchers = crawler_settings.provider_context.get_matchers(crawler_settings, filter_name=provider, force=True, matcher_type='title')
-        for matcher_element in matchers:
-            matcher = matcher_element[0]
-            for wanted_gallery in wanted_galleries:
-                results = matcher.create_closer_matches_values(wanted_gallery.search_title, cutoff=cutoff, max_matches=max_matches)
-                for gallery_data in results:
-                    gallery_data[1].dl_type = 'gallery_match'
-                    gallery = Gallery.objects.update_or_create_from_values(gallery_data[1])
-                    if gallery:
-                        GalleryMatch.objects.get_or_create(
-                            wanted_gallery=wanted_gallery,
-                            gallery=gallery,
-                            defaults={'match_accuracy': gallery_data[2]})
-                if results:
-                    logger.info(
-                        'Searched for wanted gallery: {} in panda, total possible matches: {}'.format(
-                            wanted_gallery.title,
-                            wanted_gallery.possible_matches.count()
-                        )
-                    )
-                else:
-                    logger.info(
-                        'Searched for wanted gallery: {} in panda, no match found'.format(wanted_gallery.title)
-                    )
-                # same wait_timer for all providers
-                time.sleep(crawler_settings.wait_timer)
-        logger.info('Search ended.')
-    except BaseException:
-        logger.critical(traceback.format_exc())
-
-
-# WantedGallery
-def create_matches_wanted_galleries_from_providers_internal(
-        wanted_galleries: QuerySet,
-        provider_filter: str = '', cutoff: float = 0.4, max_matches: int = 20,
-        must_be_used: bool = False
-) -> None:
-
-    try:
-        galleries_title_id = []
-
-        if provider_filter:
-            galleries = Gallery.objects.eligible_for_use(provider__contains=provider_filter)
-        else:
-            galleries = Gallery.objects.eligible_for_use()
-
-        if must_be_used:
-            galleries = galleries.filter(
-                Q(archive__isnull=False)
-                | (Q(gallery_container__isnull=False) & Q(gallery_container__archive__isnull=False))
-                | (Q(magazine__isnull=False) & Q(magazine__archive__isnull=False))
-            )
-
-        for gallery in galleries:
-            if gallery.title:
-                galleries_title_id.append(
-                    (clean_title(gallery.title), gallery.pk))
-            if gallery.title_jpn:
-                galleries_title_id.append(
-                    (clean_title(gallery.title_jpn), gallery.pk))
-
+def _match_wanted_galleries(engine: MatchingEngine, wanted_galleries: Iterable[Any], label: str) -> MatchingReport:
+    for wanted_gallery in wanted_galleries:
+        if not wanted_gallery.search_title:
+            continue
+        outcome = engine.process(MatchTarget(title=wanted_gallery.search_title))
+        for candidate in outcome.candidates:
+            if candidate.gallery_id is not None:
+                # Offline: the same gallery list is used for every wanted gallery, so found ones are filtered here.
+                if FoundGallery.objects.filter(wanted_gallery=wanted_gallery, gallery_id=candidate.gallery_id).exists():
+                    continue
+            elif candidate.gallery_data is not None:
+                candidate.gallery_data.dl_type = "gallery_match"
+            gallery = engine.resolve_gallery(candidate)
+            if gallery:
+                GalleryMatch.objects.get_or_create(
+                    wanted_gallery=wanted_gallery, gallery=gallery, defaults={"match_accuracy": candidate.accuracy}
+                )
         logger.info(
-            "Trying to match against gallery database, "
-            "{} wanted galleries with no match. Provider filter: {}".format(
-                wanted_galleries.count(),
-                provider_filter
+            "Searched ({}) for wanted gallery: {}, candidates: {}, total possible matches: {}".format(
+                label, wanted_gallery.title, len(outcome.candidates), wanted_gallery.possible_matches.count()
             )
         )
-        for wanted_gallery in wanted_galleries:
-
-            similar_list = get_list_closer_gallery_titles_from_list(
-                wanted_gallery.search_title, galleries_title_id, cutoff, max_matches)
-
-            if similar_list is not None:
-
-                logger.info("Found {} matches from title for {}".format(len(similar_list), wanted_gallery.search_title))
-                for similar in similar_list:
-                    # We filter here instead of the Gallery model, because we use the same list for every WG.
-                    if not FoundGallery.objects.filter(wanted_gallery=wanted_gallery, gallery_id=similar[1]):
-                        GalleryMatch.objects.get_or_create(
-                            wanted_gallery=wanted_gallery,
-                            gallery_id=similar[1],
-                            defaults={'match_accuracy': similar[2]})
-
-        logger.info("Matching ended")
-        return
-    except BaseException:
-        logger.critical(traceback.format_exc())
+    logger.info("Wanted gallery matching ({}) ended: {}".format(label, engine.report.summary()))
+    return engine.report
 
 
-# Archive
-def search_for_archives_matches_web(archives: ArchiveQuerySet, matcher_filter: str = '') -> None:
-
+def create_matches_wanted_galleries_from_providers(
+    wanted_galleries: QuerySet, provider: str, cutoff: float = 0.4, max_matches: int = 20
+) -> None:
+    """Online: search the providers' title matchers for each wanted gallery's search title."""
     try:
-        logger.info(
-            'Matching using match filter "{}" started for {} archives.'.format(matcher_filter, len(archives)))
-        if matcher_filter:
-            matchers = crawler_settings.provider_context.get_matchers(crawler_settings, filter_name=matcher_filter, force=True)
-        else:
-            matchers = crawler_settings.provider_context.get_matchers(crawler_settings, force=False)
-        for matcher_element in matchers:
-            matcher = matcher_element[0]
-            for archive_obj in archives:
-                if archive_obj.gallery:
-                    logger.info('Archive {} is already matched, skipping.'.format(archive_obj.title))
-                    continue
-                if matcher.type == 'title':
-                    results = matcher.create_closer_matches_values(archive_obj.title, cutoff=0.4)
-                elif matcher.type == 'image':
-                    results = matcher.create_closer_matches_values(archive_obj.zipped.name)
-                else:
-                    results = matcher.create_closer_matches_values(archive_obj.zipped.name)
-                for result in results:
-                    gallery = Gallery.objects.update_or_create_from_values(result[1])
-                    ArchiveMatches.objects.update_or_create(
-                        archive=archive_obj,
-                        gallery=gallery,
-                        match_type=matcher.type,
-                        defaults={
-                            'match_accuracy': result[2],
-                        }
+        engine = MatchingEngine(
+            crawler_settings,
+            MatchingOptions(
+                mode=MatchingMode.ONLINE,
+                filters=(provider,) if provider else (),
+                methods=("title",),
+                cutoff=cutoff,
+                max_matches=max_matches,
+                all_matchers=True,
+            ),
+        )
+        _match_wanted_galleries(engine, wanted_galleries, "online")
+    except BaseException:
+        logger.critical(traceback.format_exc())
 
-                    )
-                if results:
-                    logger.info(
-                        'Searched for archive with title: {} with matcher: {}, '
-                        'found results: {} of processed search results: {}. '
-                        'Total search results: {}'.format(
-                            archive_obj.title,
-                            matcher,
-                            archive_obj.possible_matches.count(),
-                            len(matcher.values_array),
-                            len(matcher.gallery_links)
-                        )
-                    )
-                else:
-                    logger.info(
-                        'Searched for archive with title: {} with matcher: {}, '
-                        'no match found in processed search results: {}. '
-                        'Total search results: {}'.format(
-                            archive_obj.title,
-                            matcher,
-                            len(matcher.values_array),
-                            len(matcher.gallery_links)
-                        )
-                    )
-                # same wait_timer for all providers
-                time.sleep(crawler_settings.wait_timer)
-        logger.info('Search ended.')
+
+def create_matches_wanted_galleries_from_providers_internal(
+    wanted_galleries: QuerySet,
+    provider_filter: str = "",
+    cutoff: float = 0.4,
+    max_matches: int = 20,
+    must_be_used: bool = False,
+) -> None:
+    """Offline: compare each wanted gallery's search title with the local gallery titles."""
+    try:
+        scope = GalleryScope((provider_filter,), must_be_used=must_be_used)
+        matcher = LocalTitleMatcher(scope, formatter=lambda text: text, index_normalizer=clean_title_text)
+        engine = MatchingEngine(
+            crawler_settings,
+            MatchingOptions(mode=MatchingMode.OFFLINE, filters=(provider_filter,), cutoff=cutoff, max_matches=max_matches),
+            matchers=[matcher],
+        )
+        _match_wanted_galleries(engine, wanted_galleries, "offline")
     except BaseException:
         logger.critical(traceback.format_exc())
 
 
 # Archive
-def match_archives_from_gallery_titles(archives: 'QuerySet[Archive]', cutoff: float = 0.4, max_matches: int = 20, provider: str = '') -> None:
+def generate_possible_matches_for_archives(
+    archives: "QuerySet[Archive] | None",
+    cutoff: float = 0.4,
+    max_matches: int = 20,
+    filters: Iterable[str] = (),
+    match_local: bool = True,
+    match_web: bool = True,
+    method_filter: str = "",
+    methods: Iterable[str] = (),
+    auto_link: bool = False,
+    auto_link_cutoff: float | None = None,
+    clean_title: bool = False,
+    **_ignored: Any,
+) -> None:
+    """Match archives (non-matches if none given) offline (local galleries), online (provider searches), or both.
 
+    filters are gallery provider filters offline, and matcher name filters online. methods restrict the offline
+    methods / online matcher types. With auto_link, each archive is linked to
+    its best candidate when one is good enough, otherwise the candidates are stored as possible matches.
+    Offline runs first, so archives it links aren't searched online.
+    """
     try:
         if not archives:
-            non_match_archives: 'QuerySet[Archive]' = Archive.objects.filter(match_type='non-match')
-        else:
-            non_match_archives = archives
+            archives = Archive.objects.filter(match_type="non-match")
 
-        if non_match_archives:
+        selected_methods = tuple(methods)
+        if not selected_methods and method_filter == "gid":
+            # Legacy option (tasks queued before the matching refactor): compare gids instead of titles, the other
+            # methods always ran.
+            selected_methods = tuple(x for x in available_offline_methods() if x != "title")
 
-            galleries_title_id = []
+        modes = []
+        if match_local:
+            modes.append(MatchingMode.OFFLINE)
+        if match_web:
+            modes.append(MatchingMode.ONLINE)
 
-            if provider:
-                galleries = Gallery.objects.eligible_for_use(provider__contains=provider)
-            else:
-                galleries = Gallery.objects.eligible_for_use()
-            for gallery in galleries:
-                if gallery.title:
-                    galleries_title_id.append(
-                        (replace_illegal_name(gallery.title), gallery.pk))
-                if gallery.title_jpn:
-                    galleries_title_id.append(
-                        (replace_illegal_name(gallery.title_jpn), gallery.pk))
-
-            logger.info(
-                "Trying to match against gallery database, "
-                "{} archives with no match, matching against: {}, "
-                "number of galleries: {}, cutoff: {}".format(
-                    non_match_archives.count(), provider, galleries.count(), cutoff
-                )
+        for mode in modes:
+            engine = MatchingEngine(
+                crawler_settings,
+                MatchingOptions(
+                    mode=mode,
+                    filters=tuple(filters),
+                    methods=selected_methods,
+                    cutoff=cutoff,
+                    max_matches=max_matches,
+                    auto_link=auto_link,
+                    auto_link_cutoff=auto_link_cutoff,
+                    clean_title=clean_title,
+                ),
             )
-            for i, archive in enumerate(non_match_archives, start=1):
-
-                matchers = crawler_settings.provider_context.get_matchers(
-                    crawler_settings,
-                    filter_name="{}_title".format(provider), force=True
-                )
-
-                if matchers:
-                    adj_title = matchers[0][0].format_to_compare_title(archive.zipped.name)
-                else:
-                    adj_title = get_title_from_path(archive.zipped.name)
-                similar_list = get_list_closer_gallery_titles_from_list(
-                    adj_title, galleries_title_id, cutoff, max_matches)
-
-                if similar_list is not None:
-
-                    archive.possible_matches.clear()
-
-                    logger.info(
-                        "{} of {}: Found {} matches from title for {}".format(
-                            i,
-                            non_match_archives.count(),
-                            len(similar_list),
-                            archive.zipped.name
-                        )
-                    )
-                    for similar in similar_list:
-                        gallery = Gallery.objects.get(pk=similar[1])
-
-                        ArchiveMatches.objects.create(archive=archive,
-                                                      gallery=gallery,
-                                                      match_type='title',
-                                                      match_accuracy=similar[2])
-
-                if archive.filesize is None or archive.filesize <= 0:
-                    continue
-                galleries_same_size = Gallery.objects.filter(
-                    filesize=archive.filesize)
-                if galleries_same_size.exists():
-
-                    logger.info("{} of {}: Found {} matches from filesize for {}".format(
-                                i,
-                                str(non_match_archives.count()),
-                                str(galleries_same_size.count()),
-                                archive.zipped.name)
-                                )
-                    for similar_gallery in galleries_same_size:
-                        gallery = Gallery.objects.get(pk=similar_gallery.pk)
-
-                        ArchiveMatches.objects.create(archive=archive,
-                                                      gallery=gallery,
-                                                      match_type='size',
-                                                      match_accuracy=1)
-
-        logger.info("Matching ended")
-        return
-    except BaseException:
-        logger.critical(traceback.format_exc())
-
-
-# Archive
-def generate_possible_matches_for_archives(archives: 'QuerySet[Archive]',
-                                           cutoff: float = 0.4, max_matches: int = 20,
-                                           filters: Iterable[str] = (),
-                                           match_local: bool = True,
-                                           match_web: bool = True,
-                                           update_if_local: bool = False) -> None:
-    # TODO: Not implemented: update_if_local, expose match_by_filesize.
-    try:
-        if not archives:
-            non_match_archives: 'QuerySet[Archive]' = Archive.objects.filter(match_type='non-match')
-        else:
-            non_match_archives = archives
-
-        if non_match_archives:
-
-            if match_local:
-                match_internal(non_match_archives, filters, cutoff=cutoff, max_matches=max_matches, match_by_filesize=True)
-            if match_web:
-                match_external(non_match_archives, filters, cutoff=cutoff, max_matches=max_matches)
+            # Re-evaluate the queryset each time, archives linked by a previous mode are skipped.
+            engine.match_archives(archives.all() if hasattr(archives, "all") else archives)
 
         logger.info("Matching ended, local: {}, web {}".format(match_local, match_web))
+    except BaseException:
+        logger.critical(traceback.format_exc())
+
+
+# GalleryMatchGroup
+def generate_possible_matches_for_gallery_match_groups(
+    gallery_match_groups: "QuerySet[GalleryMatchGroup]",
+    cutoff: float = 0.4,
+    max_matches: int = 20,
+    providers: Iterable[str] = (),
+    string_attributes_to_match: Iterable[str] = ("title", ),
+) -> None:
+    try:
+        if gallery_match_groups:
+
+            match_gallery_group_internal(
+                gallery_match_groups,
+                providers,
+                cutoff=cutoff,
+                max_matches=max_matches,
+                match_by_filesize=True,
+                string_attributes_to_match=string_attributes_to_match,
+            )
+
+        logger.info("Gallery Match Group matching ended")
         return
     except BaseException:
         logger.critical(traceback.format_exc())
 
 
-def match_external(archives: 'QuerySet[Archive]', matcher_filters: Iterable[str], cutoff: float = 0.4, max_matches: int = 20) -> None:
-    matchers_per_matcher_filter = {}
-    if matcher_filters:
-        for matcher_filter in matcher_filters:
-            matchers = crawler_settings.provider_context.get_matchers(
-                crawler_settings,
-                filter_name=matcher_filter,
-                force=True)
-            matchers_per_matcher_filter[matcher_filter] = matchers
-
-    else:
-        matchers_per_matcher_filter['all'] = crawler_settings.provider_context.get_matchers(crawler_settings, force=False)
-
-    for matcher_filter, matchers in matchers_per_matcher_filter.items():
-        for matcher in matchers:
-            logger.info("For filter {}, using matcher: {}".format(matcher_filter, str(matcher[0])))
-
-    for i, archive in enumerate(archives, start=1):
-
-        for matcher_filter, matchers in matchers_per_matcher_filter.items():
-
-            for matcher in matchers:
-
-                if matcher[0].type == 'title':
-                    if archive.title:
-                        results = matcher[0].create_closer_matches_values(archive.title, cutoff=cutoff, max_matches=max_matches)
-                    else:
-                        results = []
-                elif matcher[0].type == 'image':
-                    results = matcher[0].create_closer_matches_values(archive.zipped.name)
-                else:
-                    results = matcher[0].create_closer_matches_values(archive.zipped.name)
-                for result in results:
-                    gallery = Gallery.objects.update_or_create_from_values(result[1])
-                    ArchiveMatches.objects.update_or_create(
-                        archive=archive,
-                        gallery=gallery,
-                        match_type=matcher[0].type,
-                        defaults={
-                            'match_accuracy': result[2],
-                        }
-
-                    )
-                if results:
-                    logger.info(
-                        '{} of {}: Found {} matches (external search) for archive: {} using matcher: {}, '
-                        'Processed search results: {}. '
-                        'Total search results: {}'.format(
-                            i,
-                            archives.count(),
-                            len(results),
-                            archive.title,
-                            matcher[0],
-                            len(matcher[0].values_array),
-                            len(matcher[0].gallery_links)
-                        )
-                    )
-                else:
-                    logger.info(
-                        '{} of {}: Found no matches (external search) for archive: {} using matcher: {}.'.format(
-                            i,
-                            archives.count(),
-                            archive.title,
-                            matcher[0]
-                        )
-                    )
-
-
-def match_internal(archives: 'QuerySet[Archive]', providers: Iterable[str],
-                   cutoff: float = 0.4,
-                   max_matches: int = 20, match_by_filesize: bool = True, match_by_thumbnail: bool = True) -> None:
+def match_gallery_group_internal(
+    gallery_match_groups: "QuerySet[GalleryMatchGroup]",
+    providers: Iterable[str],
+    cutoff: float = 0.4,
+    max_matches: int = 20,
+    match_by_filesize: bool = True,
+    match_by_thumbnail: bool = True,
+    string_attributes_to_match: Iterable[str] = ("title", ),
+) -> None:
 
     galleries_per_provider: dict[str, QuerySet[Gallery]] = {}
-    galleries_title_id_per_provider: dict[str, list[tuple[str, str]]] = {}
+    galleries_attribute_id_type_per_provider: dict[str, list[tuple[str, str, str]]] = {}
 
     if providers:
         for provider in providers:
             galleries_per_provider[provider] = Gallery.objects.eligible_for_use(provider__contains=provider)
     else:
-        galleries_per_provider['all'] = Gallery.objects.eligible_for_use()
+        galleries_per_provider["all"] = Gallery.objects.eligible_for_use()
 
     for provider, galleries in galleries_per_provider.items():
-        galleries_title_id_per_provider[provider] = list()
+        galleries_attribute_id_type_per_provider[provider] = list()
         for gallery in galleries:
-            if gallery.title:
-                galleries_title_id_per_provider[provider].append(
-                    (replace_illegal_name(gallery.title), str(gallery.pk)))
-            if gallery.title_jpn:
-                galleries_title_id_per_provider[provider].append(
-                    (replace_illegal_name(gallery.title_jpn), str(gallery.pk)))
+            if gallery.title and "title" in string_attributes_to_match:
+                galleries_attribute_id_type_per_provider[provider].append(
+                    (replace_illegal_name(gallery.title), str(gallery.pk), "title")
+                )
+            if gallery.title_jpn and "title" in string_attributes_to_match:
+                galleries_attribute_id_type_per_provider[provider].append(
+                    (replace_illegal_name(gallery.title_jpn), str(gallery.pk), "title")
+                )
+            if gallery.comment and "comment" in string_attributes_to_match:
+                galleries_attribute_id_type_per_provider[provider].append(
+                    (replace_illegal_name(gallery.comment), str(gallery.pk), "comment")
+                )
 
-    image_type = ContentType.objects.get_for_model(Image)
-    archive_type = ContentType.objects.get_for_model(Archive)
     gallery_type = ContentType.objects.get_for_model(Gallery)
 
-    for i, archive in enumerate(archives, start=1):
+    for i, gallery_match_group in enumerate(gallery_match_groups, start=1):
+        first_gallery: Gallery | None = gallery_match_group.galleries.first()
+        if not first_gallery:
+            continue
 
-        for provider, galleries_title_id in galleries_title_id_per_provider.items():
+        for provider, galleries_attribute_id_type in galleries_attribute_id_type_per_provider.items():
 
-            if provider != 'all':
-                matchers = crawler_settings.provider_context.get_matchers(
-                    crawler_settings,
-                    filter_name="{}_title".format(provider), force=True
-                )
-                if matchers:
-                    adj_title = matchers[0][0].format_to_compare_title(archive.zipped.name)
-                else:
-                    adj_title = get_title_from_path(archive.zipped.name)
+            for attribute_match in string_attributes_to_match:
+                adj_attribute = get_title_from_path(getattr(first_gallery, attribute_match))
+
+                if adj_attribute:
+                    galleries_title_id = [(x[0], x[1]) for x in galleries_attribute_id_type if x[2] == attribute_match and x[1] != str(first_gallery.pk)]
+
+                    similar_list_provider = get_list_closer_text_from_list(
+                        adj_attribute, galleries_title_id, cutoff, max_matches
+                    )
+
+                    if similar_list_provider is not None:
+
+                        for similar in similar_list_provider:
+                            gallery = Gallery.objects.get(pk=similar[1])
+
+                            GalleryGroupPossibleMatches.objects.update_or_create(
+                                gallery_match_group=gallery_match_group, gallery=gallery, match_type=attribute_match, match_accuracy=similar[2]
+                            )
+
+                        logger.info(
+                            "{} of {}: Found {} matches for gallery: {}, using provider filter: {}, method filter: {}".format(
+                                i,
+                                gallery_match_groups.count(),
+                                len(similar_list_provider),
+                                getattr(first_gallery, attribute_match),
+                                provider,
+                                attribute_match,
+                            )
+                        )
+
+        if match_by_filesize and first_gallery.filesize is not None and first_gallery.filesize > 0:
+            if providers:
+                galleries_same_size = Gallery.objects.filter(filesize=first_gallery.filesize, provider__in=providers).exclude(pk=first_gallery.pk)
             else:
-                adj_title = get_title_from_path(archive.zipped.name)
-            similar_list_provider = get_list_closer_gallery_titles_from_list(
-                adj_title, galleries_title_id, cutoff, max_matches)
+                galleries_same_size = Gallery.objects.filter(filesize=first_gallery.filesize).exclude(pk=first_gallery.pk)
+            if galleries_same_size.exists():
 
-            if similar_list_provider is not None:
+                logger.info(
+                    "{} of {}: Found {} matches from filesize for gallery: {}".format(
+                        i, str(gallery_match_groups.count()), str(galleries_same_size.count()), first_gallery.title
+                    )
+                )
+                for similar_gallery in galleries_same_size:
+                    gallery = Gallery.objects.get(pk=similar_gallery.pk)
 
-                for similar in similar_list_provider:
-                    gallery = Gallery.objects.get(pk=similar[1])
-
-                    ArchiveMatches.objects.update_or_create(
-                        archive=archive,
+                    GalleryGroupPossibleMatches.objects.update_or_create(
+                        gallery_match_group=gallery_match_group,
                         gallery=gallery,
-                        match_type='title',
-                        match_accuracy=similar[2]
+                        match_type="size",
+                        match_accuracy=1,
                     )
 
-                logger.info(
-                    "{} of {}: Found {} matches (internal search) from title for archive: {}, with formatted title: ({}), using provider filter: {}".format(
-                        i,
-                        archives.count(),
-                        len(similar_list_provider),
-                        archive.title,
-                        adj_title,
-                        provider
-                    )
-                )
+        if match_by_thumbnail and first_gallery.thumbnail:
+            current_gallery_hashes = ItemProperties.objects.filter(
+                content_type=gallery_type, object_id=first_gallery.pk, tag="hash-compare"
+            )
 
-        if not match_by_filesize or archive.filesize is None or archive.filesize <= 0:
-            continue
-        if providers:
-            galleries_same_size = Gallery.objects.filter(filesize=archive.filesize, provider__in=providers)
+            for hash_result in current_gallery_hashes:
+                galleries_hashes = ItemProperties.objects.filter(
+                    content_type=gallery_type, tag="hash-compare", name=hash_result.name, value=hash_result.value
+                ).exclude(content_type=gallery_type, object_id=first_gallery.pk)
+
+                if galleries_hashes.exists():
+                    logger.info(
+                        "{} of {}: Found {} matches from thumbnail hashes from algorithm: {} for gallery: {}".format(
+                            i, str(gallery_match_groups.count()), str(galleries_hashes.count()), hash_result.name, first_gallery.title
+                        )
+                    )
+                    for similar_item in galleries_hashes:
+                        gallery_object = similar_item.content_object
+
+                        if not gallery_object:
+                            continue
+
+                        if providers and gallery_object and gallery_object.provider not in providers:
+                            continue
+
+                        GalleryGroupPossibleMatches.objects.update_or_create(
+                            gallery_match_group=gallery_match_group,
+                            gallery=gallery_object,
+                            match_type="hash_thumbnail_{}".format(hash_result.name),
+                            match_accuracy=1,
+                        )
+
+
+class MatchingThread(threading.Thread):
+    """Thread subclass that executes matching tasks locally or dispatches them to TaskQueue if in web process."""
+
+    def __init__(
+        self,
+        name: str,
+        target: Callable,
+        args: Iterable = (),
+        kwargs: dict[str, Any] | None = None,
+        user: Any = None,
+        settings: Any | None = None,
+    ) -> None:
+        super().__init__(name=name)
+        self.target = target
+        self.target_args = tuple(args)
+        self.target_kwargs = kwargs or {}
+        self.user = user
+        self.settings = settings
+
+    def start(self, force_local: bool = False) -> None:
+        from django.conf import settings as django_settings
+        c_settings = self.settings or getattr(django_settings, "CRAWLER_SETTINGS", None)
+        if force_local:
+            super().start()
         else:
-            galleries_same_size = Gallery.objects.filter(filesize=archive.filesize)
-        if galleries_same_size.exists():
-
-            logger.info("{} of {}: Found {} matches (internal search) from filesize for archive: {}".format(
-                i,
-                str(archives.count()),
-                str(galleries_same_size.count()),
-                archive.title)
+            from workers.client import enqueue_matching_task
+            first_arg = self.target_args[0] if self.target_args else None
+            provider = self.target_args[1] if len(self.target_args) > 1 and isinstance(self.target_args[1], str) else None
+            user_obj = self.user
+            if not user_obj and c_settings and getattr(c_settings, "archive_user", None):
+                user_obj = c_settings.archive_user
+            enqueue_matching_task(
+                task_type=self.name,
+                args=first_arg,
+                matching_kwargs=self.target_kwargs,
+                provider=provider,
+                user=user_obj,
             )
-            for similar_gallery in galleries_same_size:
-                gallery = Gallery.objects.get(pk=similar_gallery.pk)
+            logger.info("Enqueued matching task '%s' to worker process", self.name)
 
-                ArchiveMatches.objects.update_or_create(
-                    archive=archive,
-                    gallery=gallery,
-                    match_type='size',
-                    match_accuracy=1
-                )
+    def run(self) -> None:
+        try:
+            self.target(*self.target_args, **self.target_kwargs)
+        except BaseException:
+            logger.critical(traceback.format_exc())
 
-        if not match_by_thumbnail or not archive.thumbnail:
-            continue
-        current_archive_hashes = ItemProperties.objects.filter(content_type=archive_type, object_id=archive.pk, tag='hash-compare')
-
-        for hash_result in current_archive_hashes:
-            galleries_hashes = ItemProperties.objects.filter(
-                content_type=gallery_type, tag='hash-compare',
-                name=hash_result.name, value=hash_result.value
-            )
-
-            if galleries_hashes.exists():
-                logger.info(
-                    "{} of {}: Found {} matches (internal search) from thumbnail hashes from algorithm: {} for archive: {}".format(
-                        i,
-                        str(archives.count()),
-                        str(galleries_hashes.count()),
-                        hash_result.name,
-                        archive.title
-                    )
-                )
-                for similar_item in galleries_hashes:
-                    gallery_object = similar_item.content_object
-
-                    if providers and gallery_object and gallery_object.provider not in providers:
-                        continue
-
-                    ArchiveMatches.objects.update_or_create(
-                        archive=archive,
-                        gallery=gallery_object,
-                        match_type='hash_thumbnail_{}'.format(hash_result.name),
-                        match_accuracy=1
-                    )
-
-        images = Image.objects.filter(archive=archive)
-
-        current_images_hashes = ItemProperties.objects.filter(content_type=image_type, object_id__in=images, tag='hash-compare')
-
-        for hash_result in current_images_hashes:
-            galleries_hashes = ItemProperties.objects.filter(
-                content_type=gallery_type, tag='hash-compare',
-                name=hash_result.name, value=hash_result.value
-            )
-
-            image = hash_result.content_object
-
-            if image and galleries_hashes.exists():
-                logger.info(
-                    "{} of {}: Found {} matches (internal search) from image hashes from algorithm: {} for archive: {}, image: {}".format(
-                        i,
-                        str(archives.count()),
-                        str(galleries_hashes.count()),
-                        hash_result.name,
-                        archive.title,
-                        image.position
-                    )
-                )
-                for similar_item in galleries_hashes:
-
-                    gallery_object = similar_item.content_object
-
-                    if providers and gallery_object and gallery_object.provider not in providers:
-                        continue
-
-                    ArchiveMatches.objects.update_or_create(
-                        archive=archive,
-                        gallery=gallery_object,
-                        match_type='hash_image_{}_{}'.format(image.position, hash_result.name),
-                        match_accuracy=1
-                    )

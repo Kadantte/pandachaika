@@ -1,35 +1,63 @@
-from dataclasses import dataclass
+import importlib
+import statistics
+from dataclasses import dataclass, field
 from datetime import datetime
 import typing
-from typing import Optional, Union, Any
+from typing import Any, ClassVar
+
 if typing.TYPE_CHECKING:
     from core.base.setup import Settings
 
 
 # gid and provider are mandatory, since they are a unique constraint on the database.
 class GalleryData:
+    _subclasses: ClassVar[dict[str, type["GalleryData"]]] = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        GalleryData._subclasses[f"{cls.__module__}.{cls.__qualname__}"] = cls
+
     def __init__(
-            self, gid: str, provider: str,
-            token: Optional[str] = None, link: Optional[str] = None,
-            tags: Optional[list[str]] = None, title: Optional[str] = None,
-            title_jpn: Optional[str] = None, comment: Optional[str] = None,
-            gallery_container_gid: Optional[str] = None, gallery_contains_gids: Optional[list[str]] = None,
-            magazine_gid: Optional[str] = None, magazine_chapters_gids: Optional[list[str]] = None,
-            category: Optional[str] = None, posted: Optional[datetime] = None,
-            filesize: Optional[int] = None, filecount: Optional[int] = None,
-            expunged: Optional[int] = None, rating: Optional[str] = None,
-            fjord: Optional[bool] = None, hidden: Optional[bool] = None,
-            uploader: Optional[str] = None, thumbnail_url: Optional[str] = None,
-            dl_type: Optional[str] = None, public: Optional[bool] = None,
-            content: Optional[str] = None, archiver_key: Optional[str] = None,
-            root: Optional[str] = None, filename: Optional[str] = None,
-            queries: Optional[int] = None, thumbnail: Optional[str] = None,
-            status: Optional[int] = None, origin: Optional[int] = None,
-            first_gallery_gid: Optional[str] = None,
-            parent_gallery_gid: Optional[str] = None,
-            extra_provider_data: Optional[list[tuple[str, str, Any]]] = None,
-            provider_metadata: Optional[str] = None,
-            reason: Optional[str] = None, **kwargs: Any
+        self,
+        gid: str,
+        provider: str,
+        token: str | None = None,
+        link: str | None = None,
+        tags: list[str] | None = None,
+        title: str | None = None,
+        title_jpn: str | None = None,
+        comment: str | None = None,
+        gallery_container_gid: str | None = None,
+        gallery_contains_gids: list[str] | None = None,
+        magazine_gid: str | None = None,
+        magazine_chapters_gids: list[str] | None = None,
+        category: str | None = None,
+        posted: datetime | None = None,
+        filesize: int | None = None,
+        filecount: int | None = None,
+        expunged: int | None = None,
+        rating: str | None = None,
+        fjord: bool | None = None,
+        hidden: bool | None = None,
+        disowned: bool | None = None,
+        uploader: str | None = None,
+        thumbnail_url: str | None = None,
+        dl_type: str | None = None,
+        public: bool | None = None,
+        content: str | None = None,
+        archiver_key: str | None = None,
+        root: str | None = None,
+        filename: str | None = None,
+        queries: int | None = None,
+        thumbnail: str | None = None,
+        status: int | None = None,
+        origin: int | None = None,
+        first_gallery_gid: str | None = None,
+        parent_gallery_gid: str | None = None,
+        extra_provider_data: list[tuple[str, str, Any]] | None = None,
+        provider_metadata: str | None = None,
+        reason: str | None = None,
+        **kwargs: Any,
     ) -> None:
         self.gid = gid
         self.token = token
@@ -50,13 +78,14 @@ class GalleryData:
         self.comment = comment
         self.category = category
         self.posted = posted
-        self.filesize = filesize
-        self.filecount = filecount
+        self.filesize = int(filesize) if filesize is not None else None
+        self.filecount = int(filecount) if filecount is not None else None
         self.uploader = uploader
         self.thumbnail = thumbnail
         self.thumbnail_url = thumbnail_url
         self.dl_type = dl_type
         self.expunged = expunged
+        self.disowned = disowned
         self.rating = rating
         self.fjord = fjord
         self.hidden = hidden
@@ -84,20 +113,71 @@ class GalleryData:
             return False
         return self.__dict__ == other.__dict__
 
+    def to_dict(self) -> dict[str, Any]:
+        data = dict(self.__dict__)
+        if isinstance(data.get("posted"), datetime):
+            data["posted"] = data["posted"].isoformat()
+        if type(self) is not GalleryData:
+            data["_gallery_data_class"] = f"{type(self).__module__}.{type(self).__qualname__}"
+        return data
 
-DataDict = dict[str, Any]
+    @classmethod
+    def _resolve_subclass(cls, class_path: str) -> type["GalleryData"] | None:
+        if class_path in cls._subclasses:
+            return cls._subclasses[class_path]
+        if class_path.startswith("core.") and "." in class_path:
+            module_name, _, attr_name = class_path.rpartition(".")
+            try:
+                module = importlib.import_module(module_name)
+                candidate = getattr(module, attr_name, None)
+                if isinstance(candidate, type) and issubclass(candidate, cls):
+                    cls._subclasses[class_path] = candidate
+                    return candidate
+            except Exception:
+                return None
+        return None
 
-MatchesValues = tuple[str, GalleryData, float]
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GalleryData":
+        data_copy = dict(data)
+        class_path = data_copy.pop("_gallery_data_class", None)
+        target_cls: type[GalleryData] = cls
+        if cls is GalleryData:
+            if isinstance(class_path, str):
+                target_cls = cls._resolve_subclass(class_path) or cls
+            elif "temp_archive" in data_copy or "archives" in data_copy:
+                target_cls = cls._resolve_subclass("core.providers.chaika.utilities.ChaikaGalleryData") or cls
+        posted_val = data_copy.get("posted")
+        if isinstance(posted_val, str):
+            try:
+                data_copy["posted"] = datetime.fromisoformat(posted_val)
+            except ValueError:
+                pass
+        extra_data = data_copy.pop("extra_data", {})
+        instance = target_cls(**data_copy)
+        if isinstance(extra_data, dict):
+            instance.extra_data.update(extra_data)
+        return instance
+
+
+type DataDict = dict[str, Any]
+
+type MatchesValues = tuple[str, GalleryData, float]
 
 
 class ProviderSettings:
-    def __init__(self, global_settings: 'Settings', config: dict[str, Any]) -> None:
+    def __init__(self, global_settings: "Settings", config: dict[str, Any]) -> None:
         self.cookies: DataDict = {}
-        self.proxy: str = ""
+        self._proxy: str = ""
         self.proxies: DataDict = {}
+        self.headers: DataDict = {}
         self.timeout_timer: int = global_settings.timeout_timer
-        self.wait_timer: int = global_settings.wait_timer
-        self.stop_page_number: Optional[int] = None
+        self.wait_timer: float = float(global_settings.wait_timer)
+        self.stop_page_number: int | None = None
+        self.stop_on_seen_links: bool = getattr(global_settings, "stop_on_seen_links", False)
+        self.monitored_link: Any | None = None
+        self.already_seen_links_mode: str = getattr(global_settings, "already_seen_links_mode", "dont_use")
+        self.how_long_after_already_seen: Any | None = getattr(global_settings, "how_long_after_already_seen", None)
 
         # Auto updater
         self.autoupdater_enable: bool = global_settings.autoupdater.enable
@@ -105,60 +185,110 @@ class ProviderSettings:
         self.autoupdater_buffer_back: int = global_settings.autoupdater.buffer_back
         self.autoupdater_buffer_after: int = global_settings.autoupdater.buffer_after
 
-        if 'cookies' in config:
-            self.cookies.update(config['cookies'])
-        if 'general' in config:
-            if 'proxy' in config['general']:
-                self.proxy = config['general']['proxy']
-                self.proxies = {'http': config['general']['proxy'], 'https': config['general']['proxy']}
-            if 'timeout_timer' in config['general']:
-                self.timeout_timer = int(config['general']['timeout_timer'])
-            if 'wait_timer' in config['general']:
-                self.wait_timer = int(config['general']['wait_timer'])
-            if 'autoupdater_timer' in config['general']:
-                self.autoupdater_timer = float(config['general']['autoupdater_timer'])
-            if 'autoupdater_enable' in config['general']:
-                self.autoupdater_enable = config['general']['autoupdater_enable']
-            if 'autoupdater_buffer_back' in config['general']:
-                self.autoupdater_buffer_back = int(config['general']['autoupdater_buffer_back'])
-            if 'autoupdater_buffer_after' in config['general']:
-                self.autoupdater_buffer_after = int(config['general']['autoupdater_buffer_after'])
-            if 'stop_page_number' in config['general']:
-                self.stop_page_number = int(config['general']['stop_page_number'])
-        if 'proxies' in config:
-            self.proxies.update(config['proxies'])
+        # Archive download queue settings (per-provider override)
+        self.queue_archive_downloads: bool | None = None
+        self.max_parallel_archive_downloads: int = 1
+
+        if "cookies" in config:
+            self.cookies.update(config["cookies"])
+        if "headers" in config:
+            self.headers.update(config["headers"])
+        if "queue_archive_downloads" in config and config["queue_archive_downloads"] is not None:
+            self.queue_archive_downloads = bool(config["queue_archive_downloads"])
+        if "max_parallel_archive_downloads" in config and config["max_parallel_archive_downloads"] is not None:
+            self.max_parallel_archive_downloads = int(config["max_parallel_archive_downloads"])
+        if "general" in config:
+            if "proxy" in config["general"]:
+                self.proxy = config["general"]["proxy"]
+            if "timeout_timer" in config["general"]:
+                self.timeout_timer = int(config["general"]["timeout_timer"])
+            if "wait_timer" in config["general"]:
+                self.wait_timer = float(config["general"]["wait_timer"])
+            if "autoupdater_timer" in config["general"]:
+                self.autoupdater_timer = float(config["general"]["autoupdater_timer"])
+            if "autoupdater_enable" in config["general"]:
+                self.autoupdater_enable = config["general"]["autoupdater_enable"]
+            if "autoupdater_buffer_back" in config["general"]:
+                self.autoupdater_buffer_back = int(config["general"]["autoupdater_buffer_back"])
+            if "autoupdater_buffer_after" in config["general"]:
+                self.autoupdater_buffer_after = int(config["general"]["autoupdater_buffer_after"])
+            if "stop_page_number" in config["general"]:
+                self.stop_page_number = int(config["general"]["stop_page_number"])
+            if "stop_on_seen_links" in config["general"]:
+                self.stop_on_seen_links = bool(config["general"]["stop_on_seen_links"])
+            elif "stop_on_seen_link" in config["general"]:
+                self.stop_on_seen_links = bool(config["general"]["stop_on_seen_link"])
+            if "queue_archive_downloads" in config and config["general"]["queue_archive_downloads"] is not None:
+                self.queue_archive_downloads = bool(config["general"]["queue_archive_downloads"])
+            if (
+                "max_parallel_archive_downloads" in config["general"]
+                and config["general"]["max_parallel_archive_downloads"] is not None
+            ):
+                self.max_parallel_archive_downloads = int(config["general"]["max_parallel_archive_downloads"])
+        if "proxies" in config:
+            self.proxies.update(config["proxies"])
+
+    @property
+    def proxy(self) -> str:
+        return self._proxy
+
+    @proxy.setter
+    def proxy(self, value: str | None) -> None:
+        self._proxy = str(value) if value else ""
+        if self._proxy:
+            self.proxies = {"http": self._proxy, "https": self._proxy}
+        else:
+            self.proxies = {}
+
+    @property
+    def stop_on_seen_link(self) -> bool:
+        return self.stop_on_seen_links
+
+    @stop_on_seen_link.setter
+    def stop_on_seen_link(self, value: bool) -> None:
+        self.stop_on_seen_links = value
 
 
 class TorrentClient:
-
-    name = 'torrent'
+    name = "torrent"
     convert_to_base64 = False
     send_url = False
-    type = 'torrent_handler'
+    type = "torrent_handler"
 
-    def __init__(self, address: str = 'localhost', port: int = 9091, user: str = '', password: str = '', secure: bool = True) -> None:
+    def __init__(
+        self, address: str = "localhost", port: int = 9091, user: str = "", password: str = "", secure: bool = True
+    ) -> None:
         self.address = address
         self.port = str(port)
         self.user = user
         self.password = password
         self.secure = secure
         self.total_size = 0
-        self.expected_torrent_name = ''
-        self.expected_torrent_extension = ''
+        self.expected_torrent_name = ""
+        self.expected_torrent_extension = ""
         self.set_expected = True
-        self.error = ''
+        self.error = ""
 
-    def add_torrent(self, torrent_data: Union[str, bytes], download_dir: Optional[str] = None) -> bool:
-        return False
+    def add_torrent(
+        self, torrent_data: str | bytes, download_dir: str | None = None
+    ) -> tuple[bool, str | None]:
+        return False, None
 
-    def add_url(self, url: str, download_dir: Optional[str] = None) -> bool:
-        return False
+    def add_url(self, torrent_data: str, download_dir: str | None = None) -> tuple[bool, str | None]:
+        return False, None
+
+    def get_download_progress[TorrentKey](
+        self, download_list: list[tuple[str, TorrentKey]]
+    ) -> list[tuple[TorrentKey, float]] | None:
+        """Progress (0-100) of the torrents the client knows about. Torrents missing from the client are
+        left out of the result. Returns None when the client could not be queried."""
+        return None
 
     def connect(self) -> bool:
         return False
 
 
-QueueItem = dict[str, Any]
+type QueueItem = dict[str, Any]
 
 
 @dataclass
@@ -166,3 +296,67 @@ class ArchiveGenericFile:
     file_name: str
     file_size: float = 0
     position: int = 1
+
+
+@dataclass
+class ArchiveStatisticsCalculator:
+    filesize: list[int] = field(default_factory=list)
+    height: list[int] = field(default_factory=list)
+    width: list[int] = field(default_factory=list)
+    image_mode: list[str] = field(default_factory=list)
+    is_horizontal: list[bool] = field(default_factory=list)
+    file_type: list[str] = field(default_factory=list)
+
+    def set_values(
+        self,
+        filesize: int | None,
+        height: int | None,
+        width: int | None,
+        image_mode: str | None,
+        is_horizontal: bool | None,
+        file_type: str | None
+    ) -> None:
+        if filesize is not None:
+            self.filesize.append(filesize)
+        if height is not None:
+            self.height.append(height)
+        if width is not None:
+            self.width.append(width)
+        if image_mode is not None:
+            self.image_mode.append(image_mode)
+        if is_horizontal is not None:
+            self.is_horizontal.append(is_horizontal)
+        if file_type is not None:
+            self.file_type.append(file_type)
+
+    def mean(self, attr: str) -> float | None:
+        if hasattr(self, attr):
+            value = getattr(self, attr)
+            if len(value) < 1:
+                return None
+            return statistics.mean(value)
+        raise TypeError("Invalid attribute")
+
+    def mode(self, attr: str) -> typing.Any:
+        if hasattr(self, attr):
+            value = getattr(self, attr)
+            if len(value) < 1:
+                return None
+            return statistics.mode(value)
+        raise TypeError("Invalid attribute")
+
+    def stddev(self, attr: str) -> typing.Any:
+        if hasattr(self, attr):
+            value = getattr(self, attr)
+            if len(value) < 1:
+                return None
+            return statistics.pstdev(value)
+        raise TypeError("Invalid attribute")
+
+    def eq_to_value(self, attr: str, compare: typing.Any) -> typing.Any:
+        if hasattr(self, attr):
+            value = getattr(self, attr)
+            if len(value) < 1:
+                return None
+            return len([x for x in value if x == compare])/len(value)
+        raise TypeError("Invalid attribute")

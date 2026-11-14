@@ -1,4 +1,5 @@
 {% extends "viewer/base.html" %}
+{% load dict_key %}
 {% block title %}Log | {{ block.super }}{% endblock %}
 {% block sidebar %}{% endblock %}
 
@@ -9,72 +10,559 @@
       <div class="alert {% if message.tags %}alert-{{ message.tags }}{% endif %}" role="alert">{{ message }}</div>
     {% endfor %}
   {% endif %}
-  <div class="page-header">
-    <h2>Server logs</h2>
-    <p class="lead">Current server time: {% now "y-m-d, H:i:s" %}</p>
-  </div>
-  <form action="{% url 'viewer:logs' %}" method="GET">
-  <div class="row g-1">
-    <div class="col-md-3">
-        <div class="input-group align-items-center">
-            <label for="filter">Filter</label>
-            <input type="search" class="form-control" id="filter" name="filter" value="{{ request.GET.filter }}">
+  
+  <div class="page-header mb-4">
+    <div class="d-flex justify-content-between align-items-center">
+      <div>
+        <h2>Server logs</h2>
+        <p class="lead mb-0">Current server time: {% now "y-m-d, H:i:s" %}</p>
+      </div>
+      <div class="d-flex flex-wrap gap-2 align-items-center">
+        <button class="btn btn-outline-light" id="copy-logs" title="Copy visible logs to clipboard">
+          <i class="fas fa-copy"></i> Copy
+        </button>
+        <div class="input-group" style="width: auto;">
+          <button class="btn btn-outline-light" id="auto-refresh" title="Auto-refresh logs">
+            <i class="fas fa-sync"></i> Auto-refresh
+          </button>
+          <select class="form-select bg-dark text-light border-light" id="refresh-interval" data-bs-theme="dark" title="Auto-refresh frequency" style="width: auto;">
+            <option value="1000">1s</option>
+            <option value="5000" selected>5s</option>
+            <option value="10000">10s</option>
+            <option value="30000">30s</option>
+            <option value="60000">1m</option>
+          </select>
         </div>
-    </div>
-    <div class="col-md-4">
-      <button type="submit" class="btn btn-info">Apply filter</button>
-      <a class="btn btn-light" href="{% url 'viewer:logs' %}" role="button">Clear</a>
+        <div class="btn-group" role="group">
+          <button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteLogsModal" title="Delete logs">
+            <i class="fas fa-trash-alt"></i> Delete logs
+          </button>
+          <button type="button" class="btn btn-outline-danger dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown" aria-expanded="false" title="Quick delete options">
+            <span class="visually-hidden">Toggle Dropdown</span>
+          </button>
+          <ul class="dropdown-menu dropdown-menu-end dropdown-menu-dark">
+            <li><h6 class="dropdown-header text-uppercase text-secondary small fw-bold">Quick Cleanup</h6></li>
+            <li><a class="dropdown-item quick-delete-btn" href="#" data-delete-type="1_day" data-confirm="Are you sure you want to delete logs older than 1 day?"><i class="fas fa-clock text-warning me-2"></i>Older than 1 day</a></li>
+            <li><a class="dropdown-item quick-delete-btn" href="#" data-delete-type="7_days" data-confirm="Are you sure you want to delete logs older than 7 days (1 week)?"><i class="fas fa-calendar-week text-warning me-2"></i>Older than 7 days (1 week)</a></li>
+            <li><a class="dropdown-item quick-delete-btn" href="#" data-delete-type="30_days" data-confirm="Are you sure you want to delete logs older than 30 days (1 month)?"><i class="fas fa-calendar-alt text-warning me-2"></i>Older than 30 days</a></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><a class="dropdown-item" href="#" data-bs-toggle="modal" data-bs-target="#deleteLogsModal"><i class="fas fa-calendar-day text-info me-2"></i>Choose custom date...</a></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><a class="dropdown-item text-danger quick-delete-btn" href="#" data-delete-type="all" data-confirm="DANGER: Are you sure you want to permanently delete ALL server logs? This action CANNOT be undone!"><i class="fas fa-dumpster-fire me-2"></i>Delete ALL logs</a></li>
+          </ul>
+        </div>
+      </div>
     </div>
   </div>
+
+  <!-- Hidden Quick Delete Form -->
+  <form id="quick-delete-form" action="{% url 'viewer:logs' %}" method="POST" style="display: none;">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="delete_logs">
+    <input type="hidden" name="delete_type" id="quick-delete-type" value="">
   </form>
-  <!-- Next/Prev page links  -->
-  {% if log_lines.object_list and log_lines.paginator.num_pages > 1 %}
-    <div>
-        <span class="step-links">
-          <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
-          {% if log_lines.has_previous %}
-            <a href= "?{% url_replace 'page' log_lines.previous_page_number %}"> previous &lt;&lt; </a>
-          {% else %}
-            <span> previous &lt;&lt; </span>
-          {% endif %}
-          <span class="current">
-                &nbsp;Page {{ log_lines.number }} of {{ log_lines.paginator.num_pages }}
-            </span>
-          {% if log_lines.has_next %}
-            <a href="?{% url_replace 'page' log_lines.next_page_number %}"> &gt;&gt; next</a>
-          {% else %}
-            <span> &gt;&gt; next</span>
-          {% endif %}
-          <a href="?{% url_replace 'page' log_lines.paginator.num_pages %}"> &gt;&gt; last</a>
-        </span>
+
+  <!-- Delete Logs Modal -->
+  <div class="modal fade" id="deleteLogsModal" tabindex="-1" aria-labelledby="deleteLogsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+      <div class="modal-content modal-background text-white shadow-lg">
+        <div class="modal-header border-secondary">
+          <h5 class="modal-title" id="deleteLogsModalLabel">
+            <i class="fas fa-trash-alt text-danger me-2"></i>Delete Server Logs
+          </h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body p-4">
+          <p class="text-light mb-4">
+            Select an option below to delete log entries from the database. <strong class="text-warning">Deleted logs cannot be recovered.</strong>
+          </p>
+
+          <!-- Option 1: Choose a Cutoff Date -->
+          <div class="card bg-dark border-secondary mb-4">
+            <div class="card-header bg-secondary bg-opacity-25 border-secondary text-white fw-semibold">
+              <i class="fas fa-calendar-alt text-info me-2"></i>Delete logs older than a specific date
+            </div>
+            <div class="card-body">
+              <form action="{% url 'viewer:logs' %}" method="POST" id="custom-date-delete-form" onsubmit="return confirmCustomDateDelete();">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="delete_logs">
+                <input type="hidden" name="delete_type" value="custom">
+                <div class="row g-3 align-items-end">
+                  <div class="col-sm-8">
+                    <label for="custom_date" class="form-label small text-light">Cutoff date:</label>
+                    <input type="date" class="form-control bg-dark text-white border-secondary" id="custom_date" name="custom_date" required>
+                    <div class="form-text text-muted">
+                      All logs created before 00:00:00 UTC of this date will be permanently deleted.
+                    </div>
+                  </div>
+                  <div class="col-sm-4">
+                    <button type="submit" class="btn btn-warning w-100">
+                      <i class="fas fa-calendar-times me-1"></i> Delete older than date
+                    </button>
+                  </div>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- Option 2: Quick Presets -->
+          <div class="card bg-dark border-secondary mb-4">
+            <div class="card-header bg-secondary bg-opacity-25 border-secondary text-white fw-semibold">
+              <i class="fas fa-history text-info me-2"></i>Quick presets
+            </div>
+            <div class="card-body">
+              <p class="small text-muted mb-3">Delete logs older than a predefined duration relative to current time:</p>
+              <div class="d-flex flex-wrap gap-2">
+                <form action="{% url 'viewer:logs' %}" method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to delete logs older than 1 day?');">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="delete_logs">
+                  <input type="hidden" name="delete_type" value="1_day">
+                  <button type="submit" class="btn btn-outline-light">
+                    <i class="fas fa-clock text-warning me-1"></i> Older than 1 day
+                  </button>
+                </form>
+
+                <form action="{% url 'viewer:logs' %}" method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to delete logs older than 7 days (1 week)?');">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="delete_logs">
+                  <input type="hidden" name="delete_type" value="7_days">
+                  <button type="submit" class="btn btn-outline-light">
+                    <i class="fas fa-calendar-week text-warning me-1"></i> Older than 7 days (1 week)
+                  </button>
+                </form>
+
+                <form action="{% url 'viewer:logs' %}" method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to delete logs older than 30 days (1 month)?');">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="delete_logs">
+                  <input type="hidden" name="delete_type" value="30_days">
+                  <button type="submit" class="btn btn-outline-light">
+                    <i class="fas fa-calendar-alt text-warning me-1"></i> Older than 30 days (1 month)
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
+
+          <!-- Option 3: Delete All Logs -->
+          <div class="card bg-dark border-danger">
+            <div class="card-header bg-danger bg-opacity-25 border-danger text-danger fw-semibold">
+              <i class="fas fa-exclamation-triangle me-2"></i>Danger zone
+            </div>
+            <div class="card-body">
+              <div class="d-flex justify-content-between align-items-center flex-wrap gap-3">
+                <div>
+                  <h6 class="text-white mb-1">Delete all server logs</h6>
+                  <p class="text-muted small mb-0">Permanently clears every log entry in the system.</p>
+                </div>
+                <form action="{% url 'viewer:logs' %}" method="POST" class="d-inline" onsubmit="return confirm('DANGER: Are you sure you want to permanently delete ALL server logs? This action CANNOT be undone.');">
+                  {% csrf_token %}
+                  <input type="hidden" name="action" value="delete_logs">
+                  <input type="hidden" name="delete_type" value="all">
+                  <button type="submit" class="btn btn-danger">
+                    <i class="fas fa-dumpster-fire me-1"></i> Delete ALL logs
+                  </button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        </div>
+      </div>
     </div>
-  {% endif %}
-  <!-- Logs  -->
-  <div class="table-responsive">
-    <table class="table table-sm table-bordered table-striped">
-      {% for log_line, log_info in log_lines %}<tr class="result-list{% if log_info.highlighted %} highlight-row{% endif %}"><td>{{ log_line|linebreaksbr|urlize_all_rel }}</td></tr>{% endfor %}
-    </table>
   </div>
-  <!-- Next/Prev page links  -->
-  {% if log_lines.object_list and log_lines.paginator.num_pages > 1 %}
-    <div>
-        <span class="step-links">
-          <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
-          {% if log_lines.has_previous %}
-            <a href= "?{% url_replace 'page' log_lines.previous_page_number %}"> previous &lt;&lt; </a>
-          {% else %}
-            <span> previous &lt;&lt; </span>
-          {% endif %}
-          <span class="current">
-                &nbsp;Page {{ log_lines.number }} of {{ log_lines.paginator.num_pages }}
-            </span>
-          {% if log_lines.has_next %}
-            <a href="?{% url_replace 'page' log_lines.next_page_number %}"> &gt;&gt; next</a>
-          {% else %}
-            <span> &gt;&gt; next</span>
-          {% endif %}
-          <a href="?{% url_replace 'page' log_lines.paginator.num_pages %}"> &gt;&gt; last</a>
-        </span>
+
+  <div class="card bg-dark mb-4">
+    <div class="card-body">
+      <form action="{% url 'viewer:logs' %}" method="GET" id="log-filter-form">
+        <div class="row g-3">
+          <div class="col-md-3 gy-1">
+            <div class="form-group">
+              <label for="filter" class="form-label filter-options">Filter logs:</label>
+              <input type="search" class="form-control" id="filter" name="filter" value="{{ request.GET.filter }}" 
+                     placeholder="Search in logs...">
+            </div>
+          </div>
+          <div class="col-md-2 gy-1">
+            <div class="form-group">
+              <label for="logger-name" class="form-label filter-options">Logger name:</label>
+              <input type="text" class="form-control" id="logger-name" name="logger-name" value="{{ request.GET|dict_key:'logger-name' }}">
+            </div>
+          </div>
+          <div class="col-md-2 gy-1">
+            <div class="form-group">
+              <label class="form-label filter-options">Log level:</label>
+              <select class="form-select" id="log-level" name="log-level" aria-label="Select log level">
+              {% with log_level=request.GET|dict_key:'log-level' %}
+                <option{% if log_level == "" %} selected{% endif %} value="">All levels</option>
+                <option{% if log_level == "DEBUG" %} selected{% endif %} value="DEBUG">Debug</option>
+                <option{% if log_level == "INFO" %} selected{% endif %} value="INFO">Info</option>
+                <option{% if log_level == "WARNING" %} selected{% endif %} value="WARNING">Warning</option>
+                <option{% if log_level == "ERROR" %} selected{% endif %} value="ERROR">Error</option>
+                <option{% if log_level == "CRITICAL" %} selected{% endif %} value="CRITICAL">Critical</option>
+              {% endwith %}
+              </select>
+            </div>
+          </div>
+          <div class="col-md-2 gy-1">
+            <div class="form-group">
+              <label class="form-label filter-options">Context lines:</label>
+              <select class="form-select" id="context" name="context" aria-label="Select context lines" title="Show surrounding log entries before and after matches">
+              {% with ctx=request.GET.context|default:"0" %}
+                <option{% if ctx == "0" or ctx == "" %} selected{% endif %} value="0">0 (Matches only)</option>
+                <option{% if ctx == "1" %} selected{% endif %} value="1">± 1 log line</option>
+                <option{% if ctx == "2" %} selected{% endif %} value="2">± 2 log lines</option>
+                <option{% if ctx == "3" %} selected{% endif %} value="3">± 3 log lines</option>
+                <option{% if ctx == "5" %} selected{% endif %} value="5">± 5 log lines</option>
+                <option{% if ctx == "10" %} selected{% endif %} value="10">± 10 log lines</option>
+                <option{% if ctx == "20" %} selected{% endif %} value="20">± 20 log lines</option>
+              {% endwith %}
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="row mt-3">
+          <div class="col-12">
+            <button type="submit" class="btn btn-primary">
+              <i class="fas fa-search"></i> Apply filter
+            </button>
+            <a class="btn btn-secondary" href="{% url 'viewer:logs' %}" role="button">
+              <i class="fas fa-times"></i> Clear
+            </a>
+            {% if is_context_view %}
+              <span class="badge bg-info text-dark ms-2 align-middle py-2 px-2">
+                <i class="fas fa-layer-group me-1"></i> Context mode: ±{{ log_context }} line{{ log_context|pluralize }} around matches
+              </span>
+            {% endif %}
+          </div>
+        </div>
+      </form>
     </div>
+  </div>
+
+  <!-- Pagination -->
+  {% if log_lines.object_list and log_lines.paginator.num_pages > 1 %}
+    <nav aria-label="Log pagination" class="mb-4">
+      <ul class="pagination justify-content-center">
+        <li class="page-item {% if not log_lines.has_previous %}disabled{% endif %}">
+          <a class="page-link" href="?{% url_replace 'page' '1' %}">
+            <i class="fas fa-angle-double-left"></i>
+          </a>
+        </li>
+        <li class="page-item {% if not log_lines.has_previous %}disabled{% endif %}">
+          <a class="page-link" href="{% if log_lines.has_previous %}?{% url_replace 'page' log_lines.previous_page_number %}{% endif %}">
+            <i class="fas fa-angle-left"></i>
+          </a>
+        </li>
+        <li class="page-item active">
+          <span class="page-link">
+            Page {{ log_lines.number }} of {{ log_lines.paginator.num_pages }}
+          </span>
+        </li>
+        <li class="page-item {% if not log_lines.has_next %}disabled{% endif %}">
+          <a class="page-link" href="{% if log_lines.has_next %}?{% url_replace 'page' log_lines.next_page_number %}{% endif %}">
+            <i class="fas fa-angle-right"></i>
+          </a>
+        </li>
+        <li class="page-item {% if not log_lines.has_next %}disabled{% endif %}">
+          <a class="page-link" href="?{% url_replace 'page' log_lines.paginator.num_pages %}">
+            <i class="fas fa-angle-double-right"></i>
+          </a>
+        </li>
+      </ul>
+    </nav>
   {% endif %}
+
+  <!-- Logs -->
+  <div class="card bg-dark">
+    <div class="card-body p-0">
+      <div class="table-responsive">
+        <table class="table table-sm table-bordered mb-0">
+          <thead>
+            <tr>
+              <th style="width: 230px;">Timestamp</th>
+              <th style="width: 80px;">Level</th>
+              <th style="width: 200px;">Logger</th>
+              <th>Content</th>
+            </tr>
+          </thead>
+          <tbody id="log-table">
+            {% for log_line in display_logs|default:log_lines %}
+              <tr class="result-list log-line{% if is_context_view %}{% if log_line.is_match %} log-matched-row{% else %} log-context-row{% endif %}{% endif %}" id="log-{{ log_line.id }}"><td class="log-timestamp">{{ log_line.create_datetime|date:"Y-m-d H:i:s.u" }}</td>	<td class="log-content log-{{ log_line.get_level_display.lower }}">{% if is_context_view and log_line.is_match %}<span class="badge bg-primary text-white me-1" title="Direct search match">MATCH</span>{% endif %}{{ log_line.get_level_display }}</td>	<td class="log-content">{{ log_line.logger_name }}</td>	<td class="log-content">{{ log_line.msg }}{% if log_line.trace %} {{ log_line.trace }}{% endif %}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom Pagination -->
+  {% if log_lines.object_list and log_lines.paginator.num_pages > 1 %}
+    <nav aria-label="Log pagination" class="mt-4">
+      <ul class="pagination justify-content-center">
+        <li class="page-item {% if not log_lines.has_previous %}disabled{% endif %}">
+          <a class="page-link" href="?{% url_replace 'page' '1' %}">
+            <i class="fas fa-angle-double-left"></i>
+          </a>
+        </li>
+        <li class="page-item {% if not log_lines.has_previous %}disabled{% endif %}">
+          <a class="page-link" href="{% if log_lines.has_previous %}?{% url_replace 'page' log_lines.previous_page_number %}{% endif %}">
+            <i class="fas fa-angle-left"></i>
+          </a>
+        </li>
+        <li class="page-item active">
+          <span class="page-link">
+            Page {{ log_lines.number }} of {{ log_lines.paginator.num_pages }}
+          </span>
+        </li>
+        <li class="page-item {% if not log_lines.has_next %}disabled{% endif %}">
+          <a class="page-link" href="{% if log_lines.has_next %}?{% url_replace 'page' log_lines.next_page_number %}{% endif %}">
+            <i class="fas fa-angle-right"></i>
+          </a>
+        </li>
+        <li class="page-item {% if not log_lines.has_next %}disabled{% endif %}">
+          <a class="page-link" href="?{% url_replace 'page' log_lines.paginator.num_pages %}">
+            <i class="fas fa-angle-double-right"></i>
+          </a>
+        </li>
+      </ul>
+    </nav>
+  {% endif %}
+{% endblock %}
+
+{% block extra_head %}
+<style>
+.log-line {
+  font-family: 'Consolas', 'Monaco', monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-timestamp {
+  color: #888;
+  margin-right: 10px;
+}
+
+.log-content {
+    color: #fff;
+}
+
+.log-debug {
+    color: #fff !important;
+}
+
+.log-info {
+    color: #fff !important;
+}
+
+.log-warning {
+    color: yellow !important;
+}
+
+.log-error {
+    color: #f00 !important;
+}
+
+.log-fatal {
+    color: #f00 !important;
+    font-weight: bold;
+}
+
+.table > :not(caption) > * > * {
+  padding: 0.5rem;
+}
+
+.card {
+  border: 1px solid rgba(255,255,255,0.1);
+}
+
+.form-control:focus, .form-select:focus {
+  background-color: #122963;
+  color: lightgrey;
+  border-color: #0d6efd;
+}
+
+.btn-outline-light:hover {
+  background-color: rgba(255,255,255,0.1);
+}
+
+input[type="date"] {
+  color-scheme: dark;
+}
+
+.modal-content.modal-background {
+  background-color: #1a2234 !important;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.log-matched-row {
+  background-color: rgba(13, 110, 253, 0.2) !important;
+  border-left: 3px solid #0d6efd;
+}
+
+.log-context-row {
+  background-color: rgba(255, 255, 255, 0.02) !important;
+  opacity: 0.85;
+}
+
+.log-context-row:hover {
+  opacity: 1;
+}
+
+
+</style>
+{% endblock %}
+{% block afterJQ %}
+{% load compress %}
+{% compress js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+  // Copy logs functionality
+  document.getElementById('copy-logs').addEventListener('click', function() {
+    const logLines = Array.from(document.querySelectorAll('.log-line'))
+      .map(line => line.textContent)
+      .join('\n');
+    
+    navigator.clipboard.writeText(logLines).then(() => {
+      const originalText = this.innerHTML;
+      this.innerHTML = '<i class="fas fa-check"></i> Copied!';
+      setTimeout(() => {
+        this.innerHTML = originalText;
+      }, 2000);
+    });
+  });
+
+  // Auto-refresh functionality
+  const autoRefreshBtn = document.getElementById('auto-refresh');
+  const refreshIntervalSelect = document.getElementById('refresh-interval');
+  let refreshInterval = null;
+  let isRefreshing = false;
+
+  const savedLogsInterval = localStorage.getItem('logs_refresh_interval');
+  if (savedLogsInterval && refreshIntervalSelect) {
+    refreshIntervalSelect.value = savedLogsInterval;
+  }
+
+  function getIntervalMs() {
+    return parseInt(refreshIntervalSelect ? refreshIntervalSelect.value : 5000, 10) || 5000;
+  }
+
+  function startAutoRefresh() {
+    refreshLogs(); // Call immediately
+    refreshInterval = setInterval(refreshLogs, getIntervalMs());
+    if (autoRefreshBtn) {
+      autoRefreshBtn.classList.add('active', 'btn-success');
+      autoRefreshBtn.classList.remove('btn-outline-light');
+      autoRefreshBtn.innerHTML = '<i class="fas fa-stop"></i> Stop refresh';
+    }
+  }
+
+  function stopAutoRefresh() {
+    if (refreshInterval) {
+      clearInterval(refreshInterval);
+      refreshInterval = null;
+    }
+    if (autoRefreshBtn) {
+      autoRefreshBtn.classList.remove('active', 'btn-success');
+      autoRefreshBtn.classList.add('btn-outline-light');
+      autoRefreshBtn.innerHTML = '<i class="fas fa-sync"></i> Auto-refresh';
+    }
+  }
+
+  if (autoRefreshBtn) {
+    autoRefreshBtn.addEventListener('click', function() {
+      if (refreshInterval) {
+        stopAutoRefresh();
+      } else {
+        startAutoRefresh();
+      }
+    });
+  }
+
+  if (refreshIntervalSelect) {
+    refreshIntervalSelect.addEventListener('change', function() {
+      localStorage.setItem('logs_refresh_interval', this.value);
+      if (refreshInterval) {
+        clearInterval(refreshInterval);
+        refreshInterval = setInterval(refreshLogs, getIntervalMs());
+      }
+    });
+  }
+
+  async function refreshLogs() {
+    if (isRefreshing) return;
+    isRefreshing = true;
+
+    try {
+      const currentURL =new URL(window.location.href);
+      currentURL.searchParams.set("json", "1");
+      const fetchURL = currentURL.toString()
+
+      const response = await fetch(fetchURL);
+      const data = await response.json();
+      
+      const logTable = document.getElementById('log-table');
+      const existingIds = new Set(Array.from(logTable.children).map(row => row.id));
+
+      data.results.reverse().forEach(log => {
+        if (!existingIds.has(`log-${log.id}`)) {
+          const newRow = document.createElement('tr');
+          newRow.id = `log-${log.id}`;
+          const isContextView = currentURL.searchParams.get("context") && currentURL.searchParams.get("context") !== "0";
+          let rowClass = 'result-list log-line';
+          let matchBadge = '';
+          if (isContextView) {
+            if (log.is_match) {
+              rowClass += ' log-matched-row';
+              matchBadge = '<span class="badge bg-primary text-white me-1" title="Direct search match">MATCH</span>';
+            } else {
+              rowClass += ' log-context-row';
+            }
+          }
+          newRow.className = rowClass;
+          newRow.innerHTML = `<td class="log-timestamp">${log.create_datetime}</td>	<td class="log-content log-${log.level.toLowerCase()}">${matchBadge}${log.level}</td>	<td class="log-content">${log.logger_name}</td>	<td class="log-content">${log.msg}${log.trace ? ' ' + log.trace : ''}</td>`;
+          logTable.insertBefore(newRow, logTable.firstChild);
+        }
+      });
+    } catch (error) {
+      console.error('Error refreshing logs:', error);
+    } finally {
+      isRefreshing = false;
+    }
+  }
+
+  // Quick delete dropdown action handler
+  document.querySelectorAll('.quick-delete-btn').forEach(function(item) {
+    item.addEventListener('click', function(e) {
+      e.preventDefault();
+      const deleteType = this.getAttribute('data-delete-type');
+      const confirmText = this.getAttribute('data-confirm');
+      if (confirm(confirmText)) {
+        const form = document.getElementById('quick-delete-form');
+        document.getElementById('quick-delete-type').value = deleteType;
+        form.submit();
+      }
+    });
+  });
+
+  // Modal custom date delete confirmation
+  window.confirmCustomDateDelete = function() {
+    const dateInput = document.getElementById('custom_date');
+    if (!dateInput.value) {
+      alert('Please select a date.');
+      return false;
+    }
+    return confirm('Are you sure you want to delete all logs older than ' + dateInput.value + '?');
+  };
+
+  // Set default max date to today
+  const dateInput = document.getElementById('custom_date');
+  if (dateInput) {
+    const today = new Date().toISOString().split('T')[0];
+    dateInput.setAttribute('max', today);
+  }
+});
+</script>
+{% endcompress %}
 {% endblock %}

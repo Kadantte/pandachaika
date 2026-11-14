@@ -92,6 +92,11 @@
                 <input id="checkbox8" class="form-check-input" type="checkbox" name="recycled" value="1" {% if request.GET.recycled == '1' %}checked{% endif %}><label for="checkbox8" title="Unchecked won't show Archives on Recycle Bin">Recycled (only)</label>
             </div>
         </div>
+        <div class="col-md-auto">
+            <div class="form-check">
+                <input id="checkbox88" class="form-check-input" type="checkbox" name="file_deleted" value="1" {% if request.GET.file_deleted == '1' %}checked{% endif %}><label for="checkbox88" title="Archives where the file has been deleted">File Deleted (only)</label>
+            </div>
+        </div>
         {% endif %}
       <div class="col-md-auto">
         <div class="form-check">
@@ -101,6 +106,16 @@
       <div class="col-md-auto">
         <div class="form-check">
         <input id="checkbox21" class="form-check-input" type="checkbox" name="with-custom-tags" value="1" {% if "with-custom-tags" in request.GET %}checked{% endif %}><label for="checkbox21">Has custom tags</label>
+        </div>
+      </div>
+      <div class="col-md-auto">
+        <div class="form-check">
+        <input id="checkbox23" class="form-check-input" type="checkbox" name="with-scopeless-tags" value="1" {% if "with-scopeless-tags" in request.GET %}checked{% endif %}><label for="checkbox23">Has scopeless tags</label>
+        </div>
+      </div>
+      <div class="col-md-auto">
+        <div class="form-check">
+        <input id="checkbox22" class="form-check-input" type="checkbox" name="diff-filesize" value="1" {% if "diff-filesize" in request.GET %}checked{% endif %}><label for="checkbox22">Different filesize</label>
         </div>
       </div>
       </div>
@@ -118,10 +133,31 @@
                 </div>
                </div>
             {% endfor %}
+          <div class="col-md-auto align-self-center">
+            <div class="form-check">
+            <input id="checkbox-and-marks" class="form-check-input" type="checkbox" name="and-mark-conditions" value="1" {% if "and-mark-conditions" in request.GET %}checked{% endif %}><label for="checkbox-and-marks">AND conditions</label>
+            </div>
+          </div>
         </div>
       </div>
       </div>
       {% endif %}
+      <div class="page-line row g-1 align-items-center">
+        <div class="col-md-auto">
+        <button type="button" class="btn btn-secondary me-sm-2" data-bs-toggle="collapse" data-bs-target="#extra_files">Filter extra files</button>
+        </div>
+      <div id="extra_files" class="col-md-auto collapse{% if extra_file_filters %} show{% endif %}">
+        <div class="row g-1">
+            {% for field in extra_file_form_simple %}
+               <div class="col-md-auto">
+                <div class="input-group align-items-center">
+                  {{ field.label_tag }}{{ field }}
+                </div>
+               </div>
+            {% endfor %}
+        </div>
+      </div>
+      </div>
       <div class="page-line row g-1">
           <div class="col-md-auto">
             <button id="toggle-all" class="btn btn-secondary me-sm-1" type="button">Toggle All</button>
@@ -129,6 +165,9 @@
           <div class="col-md-auto">
             <button type="submit" name="apply" class="btn btn-info me-sm-1">Search</button>
             <a class="btn btn-light" href="{% url 'viewer:manage-archives' %}">Clear</a>
+            <a href="#archive-operations" class="btn btn-primary">
+              <i class="fas fa-arrow-down"></i> Jump to Archive Operations
+            </a>
           </div>
       </div>
     </form>
@@ -137,23 +176,33 @@
     <!-- Next/Prev page links  -->
     {% if results.object_list and results.paginator.num_pages > 1 %}
       <div>
-          <span class="step-links">
-              <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
+        <nav aria-label="Middle navigation">
+          <ul class="pagination justify-content-center my-0">
+            <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+                <span aria-hidden="true">&laquo;</span>
+              </a>
+            </li>
             {% if results.has_previous %}
-              <a href= "?{% url_replace 'page' results.previous_page_number %}"> previous &lt;&lt; </a>
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
             {% else %}
-              <span> previous &lt;&lt; </span>
+              <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
             {% endif %}
-            <span class="current">
-                  &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-              </span>
+            <li class="page-item">
+              <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+            </li>
             {% if results.has_next %}
-              <a href="?{% url_replace 'page' results.next_page_number %}"> &gt;&gt; next</a>
+              <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
             {% else %}
-              <span> &gt;&gt; next</span>
+              <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
             {% endif %}
-            <a href="?{% url_replace 'page' results.paginator.num_pages %}"> &gt;&gt; last</a>
-          </span>
+            <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+              <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+                <span aria-hidden="true">&raquo;</span>
+              </a>
+            </li>
+          </ul>
+        </nav>
       </div>
     {% endif %}
       <table class="table table-bordered table-sm generic-table">
@@ -169,7 +218,7 @@
               <input id="checkbox-{{ archive.id }}" class="toggle-list form-check-input" type="checkbox" name="sel-{{ archive.id }}" value="{{ archive.pk }}"><label for="checkbox-{{ archive.id }}"></label>
             </td>
             <td class="{{ archive|archive_title_class }}">
-              {{ archive.best_title }} {% if perms.viewer.view_marks and archive.manage_entries.all|length %}<span class="right-options"><i class="fas fa-bullseye {{ archive.manage_entries.first.mark_priority|mark_color }}" title="First mark reason: {{ archive.manage_entries.first.mark_reason }}"></i></span>{% endif %}
+              {{ archive.best_title }} {% if perms.viewer.view_marks and archive.indexed_entries|length %}<span class="right-options"><i class="fas fa-bullseye {{ archive.indexed_entries.0.mark_priority|mark_color }}" title="First mark reason: {{ archive.indexed_entries.0.mark_reason }}"></i></span>{% endif %}
             </td>
             <td>
               {% if archive.thumbnail.name %}
@@ -218,101 +267,196 @@
     <!-- Next/Prev page links  -->
       {% if results.object_list and results.paginator.num_pages > 1 %}
         <div>
-          <span class="step-links">
-              <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
-            {% if results.has_previous %}
-              <a href= "?{% url_replace 'page' results.previous_page_number %}"> previous &lt;&lt; </a>
-            {% else %}
-              <span> previous &lt;&lt; </span>
-            {% endif %}
-            <span class="current">
-                  &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-              </span>
-            {% if results.has_next %}
-              <a href="?{% url_replace 'page' results.next_page_number %}"> &gt;&gt; next</a>
-            {% else %}
-              <span> &gt;&gt; next</span>
-            {% endif %}
-            <a href="?{% url_replace 'page' results.paginator.num_pages %}"> &gt;&gt; last</a>
-          </span>
+          <nav aria-label="Middle navigation">
+            <ul class="pagination justify-content-center">
+              <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+                <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+                  <span aria-hidden="true">&laquo;</span>
+                </a>
+              </li>
+              {% if results.has_previous %}
+                <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
+              {% else %}
+                <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
+              {% endif %}
+              <li class="page-item">
+                <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+              </li>
+              {% if results.has_next %}
+                <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
+              {% else %}
+                <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
+              {% endif %}
+              <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+                <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+                  <span aria-hidden="true">&raquo;</span>
+                </a>
+              </li>
+            </ul>
+          </nav>
         </div>
       {% endif %}
-    <div class="mb-3">
-      <input size="10" class="form-control" name="reason" value="" placeholder="Reason" maxlength="200"/>
-    </div>
-    {% if perms.viewer.change_archivegroup %}
-        <div class="row g-1 align-items-center">
-            <div class="col-md-auto">
-            <table class="table">
-              {{ group_form }}
-            </table>
-            </div>
-            <div class="col-md-auto">
-                <button name="add_to_group" class="btn btn-light">Add to Group</button>
-            </div>
+
+      <div class="card panel mt-4" id="archive-operations">
+        <div class="card-header">
+          <h5 class="mb-0">Archive Operations</h5>
         </div>
-    {% endif %}
-    <div class="row g-1 align-items-center">
-        {% if perms.viewer.publish_archive %}
-            <div class="col-md-auto">
-                <button name="publish_archives" class="btn btn-light">Publish</button>
+        <div class="card-body">
+          <div class="row g-3">
+            <!-- Reason Input -->
+            <div class="col-12">
+              <div class="input-group">
+                <input type="text" class="form-control" name="reason" placeholder="Operation reason" maxlength="200">
+                <button type="button" class="btn btn-outline-secondary" data-bs-toggle="tooltip" title="Required for most operations">
+                  <i class="fas fa-info-circle"></i>
+                </button>
+              </div>
             </div>
-            <div class="col-md-auto">
-                <button name="unpublish_archives" class="btn btn-light">Unpublish</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.update_metadata %}
-            <div class="col-md-auto">
-                <button name="update_metadata" class="btn btn-light">Update metadata</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.recalc_fileinfo %}
-            <div class="col-md-auto">
-                <button name="recalc_fileinfo" class="btn btn-light">Recalc file info</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.mark_similar_archive %}
-            <div class="col-md-auto">
-                <button name="mark_similar" class="btn btn-light">Mark similar</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.recycle_archive %}
-            <div class="col-md-auto">
-                <button name="recycle_archives" class="btn btn-light">Move to Recycle Bin</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.expand_archive %}
-            <div class="col-md-auto">
-                <button name="reduce_archives" class="btn btn-light">Reduce</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.delete_archive %}
-            <div class="col-md-auto">
-                <button name="delete_archives" class="btn btn-light">Delete (WARNING!)</button>
-            </div>
-        {% endif %}
-        {% if perms.viewer.delete_archive and perms.viewer.mark_delete_gallery %}
-            <div class="col-md-auto">
-                <div class="form-check">
-                    <input id="checkbox7" class="form-check-input" type="checkbox" name="mark_delete_galleries" value="1"><label class="form-check-label" for="checkbox7">Mark galleries as deleted</label>
+
+            <!-- Group Management -->
+            {% if perms.viewer.change_archivegroup %}
+            <div class="col-12">
+              <div class="card panel">
+                <div class="card-header">
+                  <h6 class="mb-0">Group Operations</h6>
                 </div>
-            </div>
-        {% endif %}
-        {% if perms.viewer.delete_archive and perms.viewer.delete_gallery %}
-            <div class="col-md-auto">
-                <div class="form-check">
-                    <input id="checkbox6" class="form-check-input" type="checkbox" name="delete_galleries" value="1"><label class="form-check-label" for="checkbox6">Delete galleries</label>
+                <div class="card-body">
+                  <div class="row align-items-center">
+                    <div class="col-md-2">
+                      {% for field in group_form %}
+                      <div class="fieldWrapper">
+                          {{ field.errors }}
+                          {{ field }}
+                        </div>
+                      {% endfor %}
+                    </div>
+                    <div class="col-md-1">
+                      <button name="add_to_group" class="btn btn-primary w-100">Add to Group</button>
+                    </div>
+                  </div>
                 </div>
+              </div>
             </div>
-        {% endif %}
-        {% if user.is_staff %}
-            <div class="col-md-auto">
-                <div class="form-check">
-                    <input id="checkbox11" class="form-check-input" type="checkbox" name="run_for_all" value="1"><label class="form-check-label" for="checkbox11">Select all Archives</label>
+            {% endif %}
+
+            <!-- Main Operations -->
+            <div class="col-12">
+              <div class="d-flex flex-wrap gap-2">
+                {% if perms.viewer.publish_archive %}
+                <button name="publish_archives" class="btn btn-success">Publish</button>
+                <button name="unpublish_archives" class="btn btn-warning">Unpublish</button>
+                {% endif %}
+                {% if perms.viewer.update_metadata %}
+                <button name="update_metadata" class="btn btn-primary">Update metadata</button>
+                {% endif %}
+                {% if perms.viewer.recalc_fileinfo %}
+                <button name="recalc_fileinfo" class="btn btn-primary">Recalc file info</button>
+                {% endif %}
+                {% if manga_extractor_enabled %}
+                {% if user.is_staff or perms.viewer.extract_contextual_info %}
+                <button name="extract_contextual_info" class="btn btn-primary">Extract contextual info</button>
+                {% endif %}
+                {% endif %}
+                {% if perms.viewer.mark_similar_archive %}
+                <button name="mark_similar" class="btn btn-primary">Mark similar</button>
+                {% endif %}
+                {% if perms.viewer.recycle_archive %}
+                <button name="recycle_archives" class="btn btn-warning">Move to Recycle Bin</button>
+                {% endif %}
+                {% if perms.viewer.expand_archive %}
+                <button name="reduce_archives" class="btn btn-primary">Reduce</button>
+                {% endif %}
+              </div>
+            </div>
+
+            <!-- Gallery Operations -->
+            {% if perms.viewer.match_archive %}
+            <div class="col-12">
+              <div class="card panel">
+                <div class="card-header">
+                  <h6 class="mb-0">Gallery Operations</h6>
                 </div>
+                <div class="card-body">
+                  <div class="d-flex flex-wrap gap-2">
+                    <button name="release_gallery" class="btn btn-primary" title="Release associated Gallery">Release Gallery</button>
+                    <button name="gallery_to_alternative" class="btn btn-primary" title="Gallery to Alternative">Move Current Gallery to Alternative</button>
+                  </div>
+                </div>
+              </div>
             </div>
-        {% endif %}
-    </div>
+            {% endif %}
+
+            <!-- Archive Reason Change -->
+            {% if perms.viewer.change_archive %}
+            <div class="col-12">
+              <div class="card panel">
+                <div class="card-header">
+                  <h6 class="mb-0">Change Archive Reason</h6>
+                </div>
+                <div class="card-body">
+                  <div class="d-flex gap-2 align-items-center">
+                    <div class="input-group archive-reason-input">
+                      <input type="text" class="form-control" name="archive_reason" placeholder="New reason" maxlength="200">
+                      <button name="change_archive_reason" class="btn btn-primary">Update Reason</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- Delete Operations -->
+            {% if perms.viewer.delete_archive %}
+            <div class="col-12">
+              <div class="card panel border-danger">
+                <div class="card-header bg-danger text-white">
+                  <h6 class="mb-0">Danger Zone</h6>
+                </div>
+                <div class="card-body">
+                  <div class="row g-2">
+                    <div class="col-12 mb-2">
+                      <button name="delete_archives" class="btn btn-danger">Delete Archives (WARNING!)</button>
+                    </div>
+                    <div class="col-12">
+                      <div class="d-flex flex-wrap gap-4">
+                        {% if perms.viewer.mark_delete_gallery %}
+                        <div class="form-check">
+                          <input id="checkbox7" class="form-check-input" type="checkbox" name="mark_delete_galleries" value="1">
+                          <label class="form-check-label" for="checkbox7">Mark galleries as deleted</label>
+                        </div>
+                        {% endif %}
+                        {% if perms.viewer.delete_gallery %}
+                        <div class="form-check">
+                          <input id="checkbox6" class="form-check-input" type="checkbox" name="delete_galleries" value="1">
+                          <label class="form-check-label" for="checkbox6">Delete galleries</label>
+                        </div>
+                        {% endif %}
+                        {% if perms.viewer.approve_gallery %}
+                        <div class="form-check">
+                          <input id="checkbox13" class="form-check-input" type="checkbox" name="deny_galleries" value="1">
+                          <label class="form-check-label" for="checkbox13">Deny galleries</label>
+                        </div>
+                        {% endif %}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            {% endif %}
+
+            <!-- Staff Options -->
+            {% if user.is_staff %}
+            <div class="col-12">
+              <div class="form-check">
+                <input id="checkbox11" class="form-check-input" type="checkbox" name="run_for_all" value="1">
+                <label class="form-check-label" for="checkbox11">Select all Archives</label>
+              </div>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
     </form>
 {% endblock %}
 {% block afterJQ %}
@@ -324,7 +468,16 @@
     <link href="{% static 'css/vendor/jal/style.css' %}" type="text/css" media="all" rel="stylesheet" />
   {% endcompress %}
   {% compress js %}
-    <script src="{% static 'js/vendor/jquery.autocomplete-light.min.js' %}"></script>
+    <script src="{% static 'js/vendor/jal.js' %}"></script>
   {% endcompress %}
   <script type="text/javascript" src="{% static 'js/list_operations.js' %}"></script>
+  <script>
+    // Initialize tooltips
+    document.addEventListener('DOMContentLoaded', function() {
+      var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+      var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+        return new bootstrap.Tooltip(tooltipTriggerEl)
+      });
+    });
+  </script>
 {% endblock %}

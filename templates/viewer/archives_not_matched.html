@@ -45,24 +45,41 @@
     <div class="col-md-auto">
         <input title="Limit" size="18" type="number" step="1" class="form-control" name="limit" value="{{ request.GET.limit }}" placeholder="Archives per page"/>
     </div>
+    <div class="col-md-auto">
+        <input class="form-control" size="40" name="filename" value="{{ request.GET.filename }}" placeholder="Filename"/>
+    </div>
     </div>
   </form>
   <!-- Next/Prev page links  -->
   {% if results.object_list and results.paginator.num_pages > 1 %}
     <div>
-        <span class="step-links">
-            <a href= "?{% url_replace 'page' '1' %}">first &lt;&lt;</a>
+      <nav aria-label="Middle navigation">
+        <ul class="pagination justify-content-center my-0">
+          <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+            <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+              <span aria-hidden="true">&laquo;</span>
+            </a>
+          </li>
           {% if results.has_previous %}
-            <a href= "?{% url_replace 'page' results.previous_page_number %}"> previous &lt;&lt; </a>
+            <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
+          {% else %}
+            <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
           {% endif %}
-          <span class="current">
-                &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-            </span>
+          <li class="page-item">
+            <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+          </li>
           {% if results.has_next %}
-            <a href="?{% url_replace 'page' results.next_page_number %}"> &gt;&gt; next</a>
+            <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
+          {% else %}
+            <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
           {% endif %}
-          <a href="?{% url_replace 'page' results.paginator.num_pages %}"> &gt;&gt; last</a>
-        </span>
+          <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+            <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+              <span aria-hidden="true">&raquo;</span>
+            </a>
+          </li>
+        </ul>
+      </nav>
     </div>
   {% endif %}
   <form action="{% url 'viewer:archives-not-matched' %}" method="POST">{% csrf_token %}
@@ -111,17 +128,19 @@
           {% if archive.thumbnail.name and inline_thumbnails %}
           <p>
           {% include 'viewer/include/archive_cover.html' with show_artist=1 %}
-          {% with matches=archive.possible_galleries %}
+          {% with matches=archive.possible_galleries|dictsort:"gallery.pk" %}
             {% if matches|length > 0 %}
                 {% regroup matches by gallery as matches_list %}
-                    {% for gallery, gallery_matches in matches_list %}
-                  {% include 'viewer/include/archive_match.html' %}
-                {% endfor %}
+                    {% with matches_list_sorted=matches_list|sort_regrouped_by_max_value_in_list:"match_accuracy" %}
+                        {% for gallery, gallery_matches in matches_list_sorted %}
+                      {% include 'viewer/include/archive_match.html' %}
+                    {% endfor %}
+                {% endwith %}
             {% endif %}
           {% endwith %}
           </p>
           {% else %}
-          {% with matches=archive.possible_galleries %}
+          {% with matches=archive.possible_galleries|dictsort:"gallery.pk" %}
             {% if matches|length > 0 %}
             {% regroup matches by gallery as matches_list %}
               <table class="table table-bordered table-sm generic-table">
@@ -137,51 +156,53 @@
                 </tr>
                 </thead>
                 <tbody>
-                {% for gallery, gallery_matches in matches_list %}
-                  <tr>
-                    <td>
-                      <a href="{% url 'viewer:archive-update-tool-id' archive.pk 'select-as-match' gallery.pk %}"><i class="fas fa-check"></i></a>
-                    </td>
-                    <td>
-                      {{ gallery.artist_tags.0.name }}
-                    </td>
-                    <td>
+                {% with matches_list_sorted=matches_list|sort_regrouped_by_max_value_in_list:"match_accuracy" %}
+                    {% for gallery, gallery_matches in matches_list_sorted %}
+                      <tr>
+                        <td>
+                          <a href="{% url 'viewer:archive-update-tool-id' archive.pk 'select-as-match' gallery.pk %}"><i class="fas fa-check"></i></a>
+                        </td>
+                        <td>
+                          {{ gallery.artist_tags.0.name }}
+                        </td>
+                        <td>
 
-                    {% if gallery.thumbnail.name %}
-                      <a href="{% url 'viewer:gallery' gallery.pk %}" data-image-url="{{ gallery.thumbnail.url }}" class="img-preview" rel="popover">{{ gallery.title }}</a>
-                    {% else %}
-                      <a href="{% url 'viewer:gallery' gallery.pk %}">{{ gallery.title }}</a>
-                    {% endif %}
-                    </td>
-                    <td>
-                      {{ gallery.get_link|urlize_all_rel }}
-                    </td>
-                    <td>
-                        {% for match in gallery_matches %}
-                            <div class="d-flex justify-content-between acc-{{ match.match_accuracy|color_percent:1 }}">
-                            <div>
-                                {{ match.match_type }}
-                            </div>
-                            <div>
-                                {{ match.match_accuracy|floatformat:3 }}
-                            </div>
-                            </div>
-                        {% endfor %}
-                    </td>
-                    <td>
-                      {{ gallery.posted }}
-                    </td>
-                    <td class="{{ gallery.filecount|color_percent:archive.filecount }}">
-                      {{ gallery.filecount }}
-                    </td>
-                    <td class="{{ gallery.filesize|color_percent:archive.filesize }}">
-                      {{ gallery.filesize }}
-                    </td>
-                    <td>
-                      {{ gallery.archive_set.all|yesno }}
-                    </td>
-                  </tr>
-                {% endfor %}
+                        {% if gallery.thumbnail.name %}
+                          <a href="{% url 'viewer:gallery' gallery.pk %}" data-image-url="{{ gallery.thumbnail.url }}" class="img-preview" rel="popover">{{ gallery.title }}</a>
+                        {% else %}
+                          <a href="{% url 'viewer:gallery' gallery.pk %}">{{ gallery.title }}</a>
+                        {% endif %}
+                        </td>
+                        <td>
+                          {{ gallery.get_link|urlize_all_rel }}
+                        </td>
+                        <td>
+                            {% for match in gallery_matches %}
+                                <div class="d-flex justify-content-between acc-{{ match.match_accuracy|color_percent:1 }}">
+                                <div>
+                                    {{ match.match_type }}
+                                </div>
+                                <div>
+                                    {{ match.match_accuracy|floatformat:3 }}
+                                </div>
+                                </div>
+                            {% endfor %}
+                        </td>
+                        <td>
+                          {{ gallery.posted }}
+                        </td>
+                        <td class="{{ gallery.filecount|color_percent:archive.filecount }}">
+                          {{ gallery.filecount }}
+                        </td>
+                        <td class="{{ gallery.filesize|color_percent:archive.filesize }}">
+                          {{ gallery.filesize }}
+                        </td>
+                        <td>
+                          {{ gallery.archive_set.all|yesno }}
+                        </td>
+                      </tr>
+                    {% endfor %}
+                {% endwith %}
                 </tbody>
               </table>
             {% endif %}
@@ -196,6 +217,12 @@
     </div>
     <div class="col-md-auto">
       <input title="Max matches" size="10" type="number" step="1" class="form-control" name="max-matches" value="10" placeholder="Max Matches"/>
+    </div>
+    <div class="col-md-auto">
+      <div class="form-check mt-2">
+        <input class="form-check-input" type="checkbox" name="auto_link" id="auto_link" title="Link each archive to its best match when it's good enough, instead of only storing possible matches">
+        <label class="form-check-label" for="auto_link">Auto-link best match</label>
+      </div>
     </div>
     <div class="col-md-auto">
     <div class="dropup">
@@ -228,17 +255,33 @@
   <!-- Next/Prev page links  -->
   {% if results.object_list and results.paginator.num_pages > 1 %}
     <div>
-        <span class="step-links">
-            {% if results.has_previous %}
-              <a href= "?page={{ results.previous_page_number }}">previous &lt;&lt; </a>
-            {% endif %}
-          <span class="current">
-                &nbsp;Page {{ results.number }} of {{ results.paginator.num_pages }}
-            </span>
-          {% if results.has_next %}
-            <a href="?page={{ results.next_page_number }}"> &gt;&gt; next</a>
+      <nav aria-label="Middle navigation">
+        <ul class="pagination justify-content-center">
+          <li class="page-item{% if results.number == 1 %} disabled{% endif %}">
+            <a class="page-link" href="?{% url_replace 'page' '1' %}" aria-label="First">
+              <span aria-hidden="true">&laquo;</span>
+            </a>
+          </li>
+          {% if results.has_previous %}
+            <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.previous_page_number %}">Previous</a></li>
+          {% else %}
+            <li class="page-item disabled"><a class="page-link" href="#">Previous</a></li>
           {% endif %}
-        </span>
+          <li class="page-item">
+            <div class="mid-item">Page {{ results.number }} of {{ results.paginator.num_pages }}</div>
+          </li>
+          {% if results.has_next %}
+            <li class="page-item"><a class="page-link" href="?{% url_replace 'page' results.next_page_number %}">Next</a></li>
+          {% else %}
+            <li class="page-item disabled"><a class="page-link" href="#">Next</a></li>
+          {% endif %}
+          <li class="page-item{% if results.number == results.paginator.num_pages %} disabled{% endif %}">
+            <a class="page-link" href="?{% url_replace 'page' results.paginator.num_pages %}" aria-label="Last">
+              <span aria-hidden="true">&raquo;</span>
+            </a>
+          </li>
+        </ul>
+      </nav>
     </div>
   {% endif %}
 {% endblock %}
@@ -248,7 +291,7 @@
     <link href="{% static 'css/vendor/jal/style.css' %}" type="text/css" media="all" rel="stylesheet" />
   {% endcompress %}
   {% compress js %}
-    <script src="{% static 'js/vendor/jquery.autocomplete-light.min.js' %}"></script>
+    <script src="{% static 'js/vendor/jal.js' %}"></script>
   {% endcompress %}
   <script type="text/javascript" src="{% static 'js/list_operations.js' %}"></script>
   <script type="text/javascript" src="{% static 'js/admin.js' %}"></script>

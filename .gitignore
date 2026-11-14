@@ -1,8 +1,10 @@
 *.log
+*.log.*
 *.db
 *.pid
 settings.ini
 settings.yaml
+.django_secret_key
 
 __pycache__/
 *.py[cod]
@@ -28,3 +30,7 @@ __pycache__/
 aux_*.py
 aux_*.txt
 aux_*.json
+.env
+docker-compose.local.yml
+.agents
+/test-results/

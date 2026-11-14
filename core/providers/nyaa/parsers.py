@@ -2,7 +2,6 @@
 import logging
 import re
 import typing
-from typing import Optional
 from urllib.parse import urljoin
 from collections import defaultdict
 
@@ -22,26 +21,31 @@ class Parser(BaseParser):
     name = constants.provider_name
     accepted_urls = [
         urljoin(constants.base_url, constants.view_path),
-        urljoin(constants.base_url, constants.torrent_download_path)
+        urljoin(constants.base_url, constants.torrent_download_path),
     ]
 
     @staticmethod
-    def id_from_url(url: str) -> typing.Optional[str]:
+    def id_from_url(url: str) -> str | None:
         m = re.search(r"/view/(\d+)", url)
         if m and m.group(1):
             return m.group(1)
         else:
             return None
 
-    def crawl_urls(self, urls: list[str], wanted_filters=None, wanted_only: bool = False,
-                   preselected_wanted_matches: Optional[dict[str, list['WantedGallery']]] = None) -> None:
+    def crawl_urls(
+        self,
+        urls: list[str],
+        wanted_filters=None,
+        wanted_only: bool = False,
+        preselected_wanted_matches: dict[str, list["WantedGallery"]] | None = None,
+    ) -> None:
 
         unique_urls = set()
         gallery_data_list = []
-        gallery_wanted_lists: dict[str, list['WantedGallery']] = preselected_wanted_matches or defaultdict(list)
+        gallery_wanted_lists: dict[str, list["WantedGallery"]] = preselected_wanted_matches or defaultdict(list)
 
         if not self.downloaders:
-            logger.warning('No downloaders enabled, returning.')
+            logger.warning("No downloaders enabled, returning.")
             return
 
         for url in urls:
@@ -60,10 +64,7 @@ class Parser(BaseParser):
             if not gid:
                 continue
 
-            discard_approved, discard_message = self.discard_gallery_by_internal_checks(
-                gallery_id=gid,
-                link=gallery
-            )
+            discard_approved, discard_message = self.discard_gallery_by_internal_checks(gallery_id=gid, link=gallery)
 
             if discard_approved:
                 if not self.settings.silent_processing:
@@ -79,6 +80,4 @@ class Parser(BaseParser):
         self.pass_gallery_data_to_downloaders(gallery_data_list, gallery_wanted_lists)
 
 
-API = (
-    Parser,
-)
+API = (Parser,)

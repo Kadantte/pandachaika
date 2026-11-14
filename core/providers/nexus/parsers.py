@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 import logging
 import re
-import time
 import typing
 from collections import defaultdict
-from typing import Optional
 
 import bs4
 from bs4 import BeautifulSoup
 from django.db.models import QuerySet
 
 from core.base.parsers import BaseParser
-from core.base.utilities import (
-    translate_tag_list, request_with_retries, construct_request_dict)
+from core.base.utilities import translate_tag_list, construct_request_dict
 from core.base.types import GalleryData
 from . import constants
 from viewer.models import Gallery
@@ -27,11 +24,11 @@ class Parser(BaseParser):
     name = constants.provider_name
     accepted_urls = [constants.main_page, constants.rss_url]
 
-    def get_values_from_gallery_link(self, link: str) -> Optional[GalleryData]:
+    def get_values_from_gallery_link(self, link: str) -> GalleryData | None:
 
         request_dict = construct_request_dict(self.settings, self.own_settings)
 
-        response = request_with_retries(
+        response = self.web_request(
             link,
             request_dict,
             post=False,
@@ -41,13 +38,13 @@ class Parser(BaseParser):
             logger.error("Got no response from: {}".format(link))
             return None
 
-        response.encoding = 'utf-8'
+        response.encoding = "utf-8"
 
         match_string = re.compile(constants.main_page + r"/view/(\d+)/*$")
 
         tags = []
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, "html.parser")
 
         content_containers = soup.find_all("div", class_="container")
 
@@ -58,53 +55,74 @@ class Parser(BaseParser):
         content_container = None
 
         for box_container in content_containers:
+            if not isinstance(box_container, bs4.element.Tag):
+                continue
             content_container = box_container.find("div", class_="box")
             if content_container:
                 break
 
-        if not content_container:
+        if not isinstance(content_container, bs4.element.Tag):
             logger.error("Could not find content container")
             return None
 
         is_doujinshi = False
 
-        artists_container = content_container.find_all("a", href=re.compile('/?q=artist:.*$'))
+        artists_container = content_container.find_all("a", href=re.compile("/?q=artist:.*$"))
 
         for artist in artists_container:
             tags.append("artist:{}".format(artist.get_text()))
 
-        language_container = content_container.find_all("a", href=re.compile('/?q=language:.*$'))
+        language_container = content_container.find_all("a", href=re.compile("/?q=language:.*$"))
 
         for language in language_container:
             tags.append("language:{}".format(language.get_text()))
 
-        magazine_container = content_container.find_all("a", href=re.compile('/?q=magazine:.*$'))
+        magazine_container = content_container.find_all("a", href=re.compile("/?q=magazine:.*$"))
 
         for magazine in magazine_container:
             tags.append("magazine:{}".format(magazine.get_text()))
 
-        parody_container = content_container.find_all("a", href=re.compile('/?q=parody:.*$'))
+        parody_container = content_container.find_all("a", href=re.compile("/?q=parody:.*$"))
 
         for parody in parody_container:
             tags.append("parody:{}".format(parody.get_text()))
 
-        publisher_container = content_container.find_all("a", href=re.compile('/?q=publisher:.*$'))
+        publisher_container = content_container.find_all("a", href=re.compile("/?q=publisher:.*$"))
 
         for publisher in publisher_container:
             tags.append("publisher:{}".format(publisher.get_text()))
 
-        tags_container = content_container.find_all("a", href=re.compile('/?q=tag:.*$'))
+        tags_container = content_container.find_all("a", href=re.compile("/?q=tag:.*$"))
 
         for tag in tags_container:
             tag_cleaned = tag.get_text().replace("\t", "").replace("\n", "")
             tags.append(tag_cleaned)
 
-            if tag_cleaned == 'doujin':
+            if tag_cleaned == "doujin":
                 is_doujinshi = True
 
-        thumbnail_url = soup.find("meta", property="og:image").get('content')
+        thumbnail_url_container = soup.find("meta", property="og:image")
 
-        match_result = match_string.match(soup.find("meta", property="og:url").get('content'))
+        thumbnail_url = None
+
+        if isinstance(thumbnail_url_container, bs4.element.Tag):
+            thumbnail_content = thumbnail_url_container.get("content")
+            if isinstance(thumbnail_content, str):
+                thumbnail_url = thumbnail_content
+
+        url_container = soup.find("meta", property="og:url")
+
+        if not isinstance(url_container, bs4.element.Tag):
+            logger.error("Could not find gallery info container")
+            return None
+
+        url_content = url_container.get("content")
+
+        if not isinstance(url_content, str):
+            logger.error("Could not find gallery info container")
+            return None
+
+        match_result = match_string.match(url_content)
         if not match_result:
             logger.error("Could not find gallery info container")
             return None
@@ -132,7 +150,7 @@ class Parser(BaseParser):
 
         table_container = content_container.find("table", class_="view-page-details")
 
-        if table_container:
+        if isinstance(table_container, bs4.element.Tag):
             tr_container = table_container.find_all("tr")
 
             for tr in tr_container:
@@ -148,43 +166,33 @@ class Parser(BaseParser):
                         if is_description:
                             gallery.comment = td.get_text().replace("\t", "").replace("\n", "")
                             is_description = False
-                        if isinstance(td, bs4.element.Tag) and td.get_text() == 'Description':
+                        if isinstance(td, bs4.element.Tag) and td.get_text() == "Description":
                             is_description = True
 
                         if is_pages:
                             right_text = td.get_text().replace("\t", "").replace("\n", "")
-                            m = re.search(r'(\d+)', right_text)
+                            m = re.search(r"(\d+)", right_text)
                             if m:
                                 gallery.filecount = int(m.group(1))
                             is_pages = False
-                        if isinstance(td, bs4.element.Tag) and td.get_text() == 'Pages':
+                        if isinstance(td, bs4.element.Tag) and td.get_text() == "Pages":
                             is_pages = True
 
         gallery.archiver_key = "{}/zip/{}".format(constants.main_page, gallery_id)
 
         if is_doujinshi:
-            gallery.category = 'Doujinshi'
+            gallery.category = "Doujinshi"
         else:
-            gallery.category = 'Manga'
+            gallery.category = "Manga"
 
         return gallery
 
     # Even if we just call the single method, it allows to upgrade this easily in case group calls are supported
-    # afterwards. Also, we can add a wait_timer here.
+    # afterwards. Requests are paced by the provider's rate limit.
     def get_values_from_gallery_link_list(self, links: list[str]) -> list[GalleryData]:
         response = []
         for i, element in enumerate(links):
-            if i > 0:
-                time.sleep(self.own_settings.wait_timer)
-
-            logger.info(
-                "Calling API ({}). "
-                "Gallery: {}, total galleries: {}".format(
-                    self.name,
-                    i + 1,
-                    len(links)
-                )
-            )
+            logger.info("Calling API ({}). " "Gallery: {}, total galleries: {}".format(self.name, i + 1, len(links)))
 
             values = self.fetch_gallery_data(element)
             if values:
@@ -195,9 +203,11 @@ class Parser(BaseParser):
         return response
 
     def get_feed_urls(self) -> list[str]:
-        return [constants.rss_url, ]
+        return [
+            constants.rss_url,
+        ]
 
-    def crawl_feed(self, feed_url: str = '') -> list[str]:
+    def crawl_feed(self, feed_url: str = "") -> list[str]:
 
         urls: list[str] = []
 
@@ -215,12 +225,9 @@ class Parser(BaseParser):
 
             paged_feed_url = "{}/page/{}".format(feed_url, current_page)
 
-            if current_page > 1:
-                time.sleep(self.own_settings.wait_timer)
-
             request_dict = construct_request_dict(self.settings, self.own_settings)
 
-            response = request_with_retries(
+            response = self.web_request(
                 paged_feed_url,
                 request_dict,
                 post=False,
@@ -230,15 +237,15 @@ class Parser(BaseParser):
                 logger.error("No response from URL: {}, returning".format(paged_feed_url))
                 return urls
 
-            response.encoding = 'utf-8'
+            response.encoding = "utf-8"
 
             match_string = re.compile(r"/view/(\d+)/*$")
 
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.text, "html.parser")
 
             content_container = soup.find("div", class_="columns")
 
-            if not content_container:
+            if not isinstance(content_container, bs4.element.Tag):
                 logger.error("Content container not found, returning")
                 return urls
 
@@ -248,7 +255,10 @@ class Parser(BaseParser):
 
             for url_container in url_containers:
 
-                url_link = url_container.get('href')
+                if not isinstance(url_container, bs4.element.Tag):
+                    continue
+
+                url_link = url_container.get("href")
 
                 complete_url = "{}{}".format(constants.main_page, url_link)
 
@@ -259,23 +269,21 @@ class Parser(BaseParser):
 
             if len(current_gids) < 1:
                 logger.info(
-                    'Got to page {}, and we got less than 1 gallery, '
-                    'meaning there is no more pages, stopping'.format(current_page)
+                    "Got to page {}, and we got less than 1 gallery, "
+                    "meaning there is no more pages, stopping".format(current_page)
                 )
                 break
 
             used = Gallery.objects.filter(gid__in=current_gids, provider=constants.provider_name)
 
             if used.count() == len(current_gids):
-                logger.info(
-                    'Got to page {}, it has already been processed entirely, stopping'.format(current_page)
-                )
+                logger.info("Got to page {}, it has already been processed entirely, stopping".format(current_page))
                 break
 
-            used_gids = used.values_list('gid', flat=True)
+            used_gids = used.values_list("gid", flat=True)
 
             current_urls: list[str] = [
-                '{}/view/{}'.format(constants.main_page, x) for x in list(set(current_gids).difference(used_gids))
+                "{}/view/{}".format(constants.main_page, x) for x in list(set(current_gids).difference(used_gids))
             ]
 
             urls.extend(current_urls)
@@ -284,40 +292,52 @@ class Parser(BaseParser):
 
         return urls
 
-    def fetch_gallery_data(self, url: str) -> Optional[GalleryData]:
+    def fetch_gallery_data(self, url: str) -> GalleryData | None:
         return self.get_values_from_gallery_link(url)
 
     def fetch_multiple_gallery_data(self, url_list: list[str]) -> list[GalleryData]:
         return self.get_values_from_gallery_link_list(url_list)
 
     @staticmethod
-    def id_from_url(url: str) -> Optional[str]:
-        m = re.search(constants.main_page + r'/view/(\d+)/*$', url)
+    def id_from_url(url: str) -> str | None:
+        m = re.search(constants.main_page + r"/view/(\d+)/*$", url)
         if m and m.group(1):
             return m.group(1)
         else:
             return None
 
-    def crawl_urls(self, urls: list[str], wanted_filters: Optional[QuerySet] = None, wanted_only: bool = False,
-                   preselected_wanted_matches: Optional[dict[str, list['WantedGallery']]] = None) -> None:
+    def crawl_urls(
+        self,
+        urls: list[str],
+        wanted_filters: QuerySet | None = None,
+        wanted_only: bool = False,
+        preselected_wanted_matches: dict[str, list["WantedGallery"]] | None = None,
+    ) -> None:
 
         unique_urls = set()
         gallery_data_list = []
         fetch_format_galleries = []
-        gallery_wanted_lists: dict[str, list['WantedGallery']] = preselected_wanted_matches or defaultdict(list)
+        gallery_wanted_lists: dict[str, list["WantedGallery"]] = preselected_wanted_matches or defaultdict(list)
 
         if not self.downloaders:
-            logger.warning('No downloaders enabled, returning.')
+            logger.warning("No downloaders enabled, returning.")
             return
 
+        is_bulk = len(urls) > 50 or self.settings.silent_processing
+        if is_bulk and not self.settings.silent_processing:
+            logger.info("Classifying %d URLs for provider %s...", len(urls), self.name)
+
+        skipped_invalid = 0
         for url in urls:
 
             if constants.main_page not in url:
-                logger.warning("Invalid URL, skipping: {}".format(url))
+                skipped_invalid += 1
+                if not is_bulk:
+                    logger.warning("Invalid URL, skipping: {}".format(url))
                 continue
 
-            if '/view/' in url or '/read/' in url or '/zip/' in url:
-                if not self.settings.silent_processing:
+            if "/view/" in url or "/read/" in url or "/zip/" in url:
+                if not is_bulk and not self.settings.silent_processing:
                     logger.info("Provided URL {} is a gallery link, adding".format(url))
                 unique_urls.add(url)
                 continue
@@ -325,12 +345,22 @@ class Parser(BaseParser):
             if constants.rss_url in url:
                 feed_links = self.crawl_feed(url)
                 unique_urls.update(feed_links)
-                logger.info("Provided RSS URL for provider ({}), adding {} found links".format(
-                    self.name,
-                    len(feed_links))
+                logger.info(
+                    "Provided RSS URL for provider ({}), adding {} found links".format(self.name, len(feed_links))
                 )
                 continue
 
+        if is_bulk and not self.settings.silent_processing:
+            logger.info(
+                "Extracted %d unique gallery links%s from %d URLs for provider %s.",
+                len(unique_urls),
+                f" ({skipped_invalid} invalid skipped)" if skipped_invalid else "",
+                len(urls),
+                self.name,
+            )
+
+        is_bulk_unique = len(unique_urls) > 50 or self.settings.silent_processing
+        discarded_count = 0
         for gallery in unique_urls:
 
             gid = self.id_from_url(gallery)
@@ -340,46 +370,80 @@ class Parser(BaseParser):
             discard_approved, discard_message = self.discard_gallery_by_internal_checks(gid, link=gallery)
 
             if discard_approved:
-                if not self.settings.silent_processing:
+                discarded_count += 1
+                if not is_bulk_unique and not self.settings.silent_processing:
                     logger.info(discard_message)
                 continue
 
             fetch_format_galleries.append(gallery)
 
+        self.log_database_check_summary(
+            total=len(unique_urls),
+            existing=discarded_count,
+            discarded=discarded_count,
+            to_update=0,
+        )
+
+        if len(fetch_format_galleries) > 0:
+            logger.info(
+                "Queued %d galleries to fetch metadata (out of %d total).",
+                len(fetch_format_galleries),
+                len(unique_urls),
+            )
+
         galleries_data = self.fetch_multiple_gallery_data(fetch_format_galleries)
+
+        banned_count = 0
+        unmatched_wanted_count = 0
+        matched_wanted_count = 0
 
         for internal_gallery_data in galleries_data:
 
             if not internal_gallery_data.link:
                 continue
 
-            banned_result, banned_reasons = self.general_utils.discard_by_gallery_data(internal_gallery_data.tags, internal_gallery_data.uploader)
+            banned_result, banned_reasons = self.general_utils.discard_by_gallery_data(
+                internal_gallery_data.tags, internal_gallery_data.uploader, gallery_data=internal_gallery_data
+            )
 
             if banned_result:
+                banned_count += 1
+                if self.gallery_callback:
+                    self.gallery_callback(None, internal_gallery_data.link, "banned_data")
+
                 if not self.settings.silent_processing:
                     logger.info(
                         "Skipping gallery link {}, discarded reasons: {}".format(
-                            internal_gallery_data.link,
-                            banned_reasons
+                            internal_gallery_data.link, banned_reasons
                         )
                     )
                 continue
 
             if wanted_filters:
                 self.compare_gallery_with_wanted_filters(
-                    internal_gallery_data,
-                    internal_gallery_data.link,
-                    wanted_filters,
-                    gallery_wanted_lists
+                    internal_gallery_data, internal_gallery_data.link, wanted_filters, gallery_wanted_lists
                 )
                 if wanted_only and not gallery_wanted_lists[internal_gallery_data.gid]:
+                    unmatched_wanted_count += 1
                     continue
 
+            if len(gallery_wanted_lists.get(internal_gallery_data.gid, [])) > 0:
+                matched_wanted_count += 1
+
             gallery_data_list.append(internal_gallery_data)
+
+        self.log_metadata_evaluation_summary(
+            total_evaluated=len(fetch_format_galleries),
+            accepted=len(gallery_data_list),
+            matched_wanted=matched_wanted_count,
+            unmatched_wanted=unmatched_wanted_count,
+            banned=banned_count,
+            errors=0,
+            wanted_filters=bool(wanted_filters),
+            wanted_only=wanted_only,
+        )
 
         self.pass_gallery_data_to_downloaders(gallery_data_list, gallery_wanted_lists)
 
 
-API = (
-    Parser,
-)
+API = (Parser,)

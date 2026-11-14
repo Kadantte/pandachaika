@@ -3,11 +3,13 @@ Backend+Frontend for viewing, matching and downloading hentai-manga galleries in
 
 Runs the [panda.chaika.moe](https://panda.chaika.moe) website, behind NGINX.
 
+Note: Code is managed internally on another repository. This repository is used as a mirror, pushed to from time to time.
+
 Overview
 ---------------------
 Program is separated into two parts, one command line program that you can feed e-hentai.org/exhentai.org (panda) links, and it will download them using either torrent or archive/GP/Credits. The files will be kept on the filesystem as zip files. After downloading, all associated metadata will be obtained and stored on a database. Downloads using torrents can be handled by downloading to an external server, from which you can then download to the running server using FTPS.
 
-This program also does local file matching, getting metadata for files you've already downloaded from different providers. This is based on the title of the files, or also on the first file on those archives. See matchers.py of each provider folder for more details.
+This program also does local file matching, getting metadata for files you've already downloaded from different providers. Online matching searches the providers (by file title, CRC32, size, or the first image of the archive, see matchers.py of each provider folder), and offline matching compares with the galleries already in the local database (see core/matching). Both can store the results as possible matches, or link each archive to its best match.
 
 The second part of this program is a Django-based application, that will run a server to serve this files via web browser to your clients. It has several options to search based on the metadata retrieved. This part also can call the command line program to trigger the download of new galleries.
 
@@ -15,29 +17,25 @@ It also includes a JSON API and a UserScript for panda, that allows you to queue
 
 Note: For now it's designed to generate and match .zip files, doesn't work with unpacked galleries.
 
-Note 2: SQLite as a backend is no longer supported, either mysql or postgresql must be used.
+Note 2: SQLite and MySQL are unsupported; PostgreSQL (e.g. 16/17) must be used.
 
 Requirements
 ---------------------
 
 Know how to run a Python program and how to install packages.
 
-Python [3.9, 3.10, 3.11] are the target versions, it won't work on Python 2.
+Python [3.13, 3.14, 3.15] are the tested versions, it won't work on Python 2.
 
 See requirements.txt.
-
-You can configure the requirements, and remove the modules you aren't going to use (MySQL, rarfile, etc.)
-
-The [mysqlclient](https://github.com/PyMySQL/mysqlclient-python) python package requires some headers and libraries, check their documentation.
 
 How to run
 ---------------------
 
 Clone/download.
 
-Read defaults.ini for explanations on most configurable options.
+Read defaults.yaml for explanations on most configurable options.
 
-Copy defaults.ini to settings.ini. Edit settings.ini (before running it!).
+Copy defaults.yaml to settings.yaml. Edit settings.yaml (before running it!).
 
 Install the requirements:
 
@@ -55,7 +53,7 @@ Run "python manage.py compress", to compress js/css static files.
 
 Run "python manage.py providers --scan-register", to register starting information to the database.
 
-To use Elasticsearch, after you install it correctly, check settings.ini accordingly and run "python manage.py push-to-index -r -p".
+To use Elasticsearch, after you install it correctly, check settings.yaml accordingly and run "python manage.py push-to-index -r -rg -rm".
 
 Start the webserver with "python server.py".
 
@@ -66,3 +64,10 @@ If you want to run every request through a proxy, export the environment variabl
 $ export HTTP_PROXY="http://10.10.1.10:3128"
 $ export HTTPS_PROXY="http://10.10.1.10:1080"
 ~~~~
+
+Documentation
+---------------------
+
+- [Public JSON API Documentation](docs/api/README.md)
+- [Docker Setup Guide](docs/DOCKER.md)
+

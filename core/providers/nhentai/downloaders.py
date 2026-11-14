@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urljoin
 
 from core.base.types import DataDict
@@ -20,7 +20,7 @@ class TorrentDownloader(BaseTorrentDownloader):
 
     @staticmethod
     def get_download_link(url: str) -> str:
-        return urljoin(url, 'download')
+        return urljoin(url, "download")
 
     def start_download(self) -> None:
 
@@ -40,27 +40,25 @@ class TorrentDownloader(BaseTorrentDownloader):
 
         torrent_link = self.get_download_link(self.gallery.link)
 
-        logger.info("Adding torrent to client. Link: {}". format(torrent_link))
+        logger.info("Adding torrent to client. Link: {}".format(torrent_link))
         self.connect_and_download(client, torrent_link)
 
-    def update_archive_db(self, default_values: DataDict) -> Optional['Archive']:
+    def update_archive_db(self, default_values: DataDict) -> Archive | None:
 
         if not self.gallery:
             return None
 
         values = {
-            'title': self.gallery.title,
-            'title_jpn': self.gallery.title_jpn,
-            'zipped': self.gallery.filename,
-            'crc32': self.crc32,
-            'filesize': self.gallery.filesize,
-            'filecount': self.gallery.filecount,
+            "title": self.gallery.title,
+            "title_jpn": self.gallery.title_jpn,
+            "zipped": self.gallery.filename,
+            "crc32": self.crc32,
+            "filesize": self.gallery.filesize,
+            "filecount": self.gallery.filecount,
         }
         default_values.update(values)
         return Archive.objects.update_or_create_by_values_and_gid(
-            default_values,
-            (self.gallery.gid, self.gallery.provider),
-            zipped=self.gallery.filename
+            default_values, (self.gallery.gid, self.gallery.provider), zipped=self.gallery.filename
         )
 
 
@@ -71,7 +69,7 @@ class InfoDownloader(BaseInfoDownloader):
 
 class UrlSubmitDownloader(BaseDownloader):
 
-    type = 'submit'
+    type = "submit"
     provider = constants.provider_name
 
     def start_download(self) -> None:
